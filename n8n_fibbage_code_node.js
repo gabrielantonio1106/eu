@@ -31,20 +31,66 @@ function parseIntStrict(s) {
   return n;
 }
 
-function parseMenuNumberLoose(s) {
-  const raw = String(s ?? "").trim();
-  if (!raw) return null;
-  const keycapNorm = raw.replace(/([0-9])️?⃣/g, "$1");
-  const normalized = keycapNorm.replace(/^\s*,\s*/, "").trim();
+// Parser flexível para números de menu - aceita 1, 1), 1., 1️⃣, opção 2, etc.
+function parseMenuNumberLoose(input) {
+  const s = String(input ?? "").trim();
+  if (!s) return null;
+  
+  // Tentar extrair número de várias formas
+  const patterns = [
+    /^(\d+)\)?\.?\s*$/,           // 1, 1), 1., 1 ), 1 .
+    /^(\d+)\)?\.?\s+.+$/,          // 1 texto, 1) texto
+    /^[🔴1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣8️⃣9️⃣0️⃣]+$/,  // apenas emojis de números
+    /^opção\s+(\d+)/i,            // opção 1
+    /^opc?\.?\s*(\d+)/i,          // opc 1, opc. 1
+  ];
+  
+  for (const pattern of patterns) {
+    const m = s.match(pattern);
+    if (m) {
+      const n = parseIntStrict(m[1] || s);
+      if (n !== null) return n;
+    }
+  }
+  
+  // Se nada funcionou, tentar parseIntStrict direto
+  return parseIntStrict(s);
+}
 
-  const strict = parseIntStrict(normalized);
-  if (strict !== null) return strict;
+// Mapeamento de steps legados para steps atuais
+const LEGACY_STEP_MAP = {
+  // Criação de sala
+  "CREATE_STEP_NAME": "ROOM_CREATE_NAME",
+  "CREATE_STEP_VISIBILITY": "ROOM_CREATE_VISIBILITY",
+  "CREATE_STEP_PASSWORD": "ROOM_CREATE_PASSWORD",
+  "CREATE_STEP_MODE": "ROOM_CREATE_MODE",
+  "CREATE_STEP_ROUNDS": "ROOM_CREATE_ROUNDS",
+  "CREATE_WAIT_VINC": "ROOM_CREATE_WAIT_VINC",
+  "ROOM_CREATE": "ROOM_CREATE_NAME",
+  
+  // Lobby
+  "LOBBY_MENU": "BOT_ACCESS",
+  "LOBBY": "BOT_ACCESS",
+  "BOT_ACTIVE": "BOT_ACCESS",
+  
+  // Tutorial
+  "ROOM_START_TUTORIAL_Q": "ASK_TUTORIAL",
+  "ASK_TUTORIAL_YES": "ASK_TUTORIAL",
+  
+  // Config legada
+  "CONFIG_NAME": "CONFIG_RENAME",
+  "CONFIG_PASSWORD": "CONFIG_SET_PASSWORD",
+  
+  // Entrada
+  "ENTERING_PASSWORD": "ENTER_PASSWORD",
+  "ENTER_PASSWORD_WAIT": "ENTER_PASSWORD",
+};
 
-  // aceita formatos comuns: "1)", "1.", "opção 2", "número 3"
-  const m = normalized.match(/(^|\D)(-?\d{1,2})(?=\D|$)/);
-  if (!m) return null;
-  const n = Number(m[2]);
-  return Number.isFinite(n) ? n : null;
+// Normaliza steps legados para steps atuais
+function normalizeLegacyStep(step) {
+  if (!step) return step;
+  const normalized = String(step).trim();
+  return LEGACY_STEP_MAP[normalized] || normalized;
 }
 
 function fisherYatesShuffle(arr, rng) {
@@ -285,7 +331,9 @@ function buildOutput(state, actions = [], debugObj = null, message = {}) {
         const pObj = room.players?.[pid] || { name: "Jogador", is_bot: false };
         upsertParticipante(salaId, pid, pObj, room);
       }
-    } else if (senderId) {
+    } else if (senderId && msg.chat_type === "private") {
+      // SOLUÇÃO: Só registrar participantes no BOT_ACCESS parachats privados
+      // Grupos não devem ser registrados como participantes
       const name = state?.users?.[senderId]?.name ?? msg.sender_name ?? "Jogador";
       upsertParticipante("BOT_ACCESS", senderId, { name, is_bot: false }, null);
     }
@@ -351,25 +399,27 @@ function lobbyMenuText() {
   ].join("\n");
 }
 
-
-
 function configMenuText(room) {
   return [
     `⚙️ CONFIGURAÇÕES DA SALA — ${room.name}`,
     "",
     "━━━━━━━━━━━━━━━",
-    "1️⃣ Alterar número de rodadas",
-    "2️⃣ Tipos de pergunta",
-    "3️⃣ Alterar máximo de jogadores",
-    "4️⃣ Alterar visibilidade",
-    "5️⃣ Alterar modo (Clássico / EAY)",
-    "6️⃣ Encerrar sala",
+    "1️⃣ Alterar nome da sala",
+    "2️⃣ Alterar número de rodadas",
+    "3️⃣ Tipos de pergunta",
+    "4️⃣ Alterar máximo de jogadores",
+    "5️⃣ Alterar visibilidade",
+    "6️⃣ Alterar modo (Clássico / EAY)",
+    "7️⃣ Adicionar bots à sala",
+    "8️⃣ Expulsar jogador",
+    "9️⃣ Encerrar sala",
     "0️⃣ Voltar ao painel da sala",
     "━━━━━━━━━━━━━━━",
     "",
     "Digite o número da opção 👇",
   ].join("\n");
 }
+
 function listRoomsText(state) {
   const rooms = Object.values(state.rooms || {}).filter((r) => r && (r.visibility === "publica" || r.visibility === "privada") && r.status !== "ENDED");
   if (!rooms.length) {
@@ -475,14 +525,37 @@ function createRoomSkeleton({ code, host_chat_id, host_name }) {
 
 function parseIncoming(message) {
   const text = String(message.text ?? "").trim();
-  const isGroup = message.chat_type === "group";
-  const isPrivate = message.chat_type === "private";
+  
+  // Detecção mais robusta de grupo vs privado
+  //优先使用message.chat_type, mas também verificar other indicators
+  let isGroup = message.chat_type === "group";
+  let isPrivate = message.chat_type === "private";
+  
+  // Se chat_type não foi definido explicitamente, tentar detectar por outros sinais
+  if (!isGroup && !isPrivate) {
+    // Se há um group_id diferente do sender, é grupo
+    const chatId = String(message.chat_id ?? "");
+    const senderId = String(message.sender_chat_id ?? "");
+    // No WhatsApp, grupos usually have different IDs
+    // Se chat_id for diferente do sender_chat_id e parece um ID de grupo...
+    if (chatId && senderId && chatId !== senderId) {
+      // Tentar detectar por padrões comuns de ID de grupo
+      // Geralmente IDs de grupo são mais longos ou contêm certos padrões
+      if (chatId.length > 20 || chatId.includes("@g")) {
+        isGroup = true;
+      }
+    }
+  }
 
   const sender_chat_id = String(message.sender_chat_id ?? "");
   const chat_id = String(message.chat_id ?? "");
   const sender_name = String(message.sender_name ?? "");
 
+  
+  
   if (isGroup) {
+    // Apenas processar mensagens de grupo se começarem com 'vinc' ou ','
+    const text = String(message.text ?? "").trim();
     const m = text.match(/^vinc\s+(\d{1,2})$/i);
     if (m) return { kind: "VINC", code: pad2(m[1]), sender_chat_id, sender_name, chat_id, text };
     if (text.startsWith(",")) return { kind: "GROUP_CMD", cmd: text.slice(1).trim().toLowerCase(), sender_chat_id, sender_name, chat_id, text };
@@ -1200,27 +1273,61 @@ function normalizeInputAggregate(rawInput) {
 
   const norm = (v) => (typeof v === "string" ? v.trim() : "");
 
-  const rawText = sender?.text ?? ctx?.last_message_text ?? ctx?.client_last_message_text ?? webhook?.body?.Payload?.Content?.LastMessage?.Content ?? "";
+  // text: priorizar a mensagem do cliente (client_last_message_text)
+  // isso é o que o usuário enviou no privado do bot
+  // text: PRIORIZAR sender (data[1]) - dados atuais da mensagem
+  // sender.text contém a mensagem que o usuário enviou AGORA
+  // ctx tem dados desatualizados da interação anterior
+  const rawText = 
+    sender?.text ?? 
+    ctx?.client_last_message_text ?? 
+    ctx?.last_message_text ?? 
+    webhook?.body?.Payload?.Content?.LastMessage?.Content ?? 
+    "";
   const text = norm(rawText);
 
+  // Detectar se é grupo ou privado
+  // Prioridade: ContactType do webhook
   const isGroup = (() => {
-    const gi = webhook?.body?.Payload?.Content?.Contact?.GroupIdentifier ?? webhook?.body?.Payload?.Content?.GroupIdentifier ?? null;
-    if (gi) return true;
-    const ct = webhook?.body?.Payload?.Content?.Contact?.ContactType;
-    if (ct && ct !== "DirectMessage") return true;
-    return false;
+    const contactType = webhook?.body?.Payload?.Content?.Contact?.ContactType;
+    const groupId = webhook?.body?.Payload?.Content?.Contact?.GroupIdentifier ?? webhook?.body?.Payload?.Content?.GroupIdentifier;
+    
+    // Se tem GroupIdentifier, é grupo
+    if (groupId) return true;
+    
+    // Se tem ContactType e não é DirectMessage, é grupo
+    if (contactType && contactType !== "DirectMessage") return true;
+    
+    // Se é DirectMessage, é privado
+    if (contactType === "DirectMessage") return false;
+    
+    return false; // default: privado
   })();
 
+  // chat_id: é o ID da conversa/chat atual (onde a mensagem foi recebida)
+  // PRIORIDADE: sender.sender_chat_id (chat atual do remetente) > webhook > fallback
+  // IMPORTANTE: sender.sender_chat_id é o chat atual onde o usuário está interagindo
   const chatId =
-    sender?.chat_id ??
     sender?.sender_chat_id ??
     webhook?.body?.Payload?.Content?.Id ??
     webhook?.body?.Payload?.Content?.LastMessage?.Chat?.Id ??
-    webhook?.body?.Payload?.Content?.Contact?.Id ??
     "UNKNOWN";
 
-  const senderChatId = sender?.sender_chat_id ?? webhook?.body?.Payload?.Content?.LastMessage?.FromContact?.Id ?? chatId;
-  const senderName = sender?.sender_name ?? webhook?.body?.Payload?.Content?.Contact?.Name ?? ctx?.sender_name ?? "Jogador";
+  // sender_chat_id: PRIORIZAR o sender (data[1]) - é quem enviou a mensagem!
+  // só usar fallback do webhook se não tiver no sender
+  const senderChatId = 
+    sender?.sender_chat_id ?? 
+    webhook?.body?.Payload?.Content?.LastMessage?.FromContact?.Id ??
+    webhook?.body?.Payload?.Content?.Contact?.Id ??
+    chatId;
+
+  // sender_name: PRIORIZAR o sender (data[1]) - é quem enviou a mensagem!
+  const senderName = 
+    sender?.sender_name ?? 
+    webhook?.body?.Payload?.Content?.Contact?.Name ??
+    ctx?.sender_name ??
+    ctx?.nome ??
+    "Jogador";
 
   const msg = {
     chat_type: isGroup ? "group" : "private",
@@ -1229,6 +1336,8 @@ function normalizeInputAggregate(rawInput) {
     sender_name: String(senderName),
     text,
   };
+
+
 
   const st = wrapper?.state || ctx?.state || null;
   return { msg, st, tag: "aggregate_data", aggregate_ctx: ctx, aggregate_sender: sender };
@@ -1239,45 +1348,6 @@ function hydrateStateFromAggregateContext(state, compat) {
   const ctx = compat?.aggregate_ctx || {};
   const sender = compat?.aggregate_sender || {};
 
-  const normalizePromptText = (rawText) =>
-    String(rawText ?? "")
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "");
-
-  const detectStepFromText = (rawText) => {
-    const txt = normalizePromptText(rawText);
-    if (!txt) return null;
-    const markers = [
-      { step: "SET_NAME", needle: "alterar nome" },
-      { step: "SET_NAME", needle: "digite o novo nome" },
-      { step: "ROOM_CREATE_NAME", needle: "passo 1/5" },
-      { step: "ROOM_CREATE_NAME", needle: "nome da sala" },
-      { step: "ROOM_CREATE_VISIBILITY", needle: "passo 2/5" },
-      { step: "ROOM_CREATE_VISIBILITY", needle: "visibilidade" },
-      { step: "ROOM_CREATE_PASSWORD", needle: "passo 3/5" },
-      { step: "ROOM_CREATE_PASSWORD", needle: "definir senha" },
-      { step: "ROOM_CREATE_MODE", needle: "passo 4/5" },
-      { step: "ROOM_CREATE_MODE", needle: "modo de jogo" },
-      { step: "ROOM_CREATE_ROUNDS", needle: "passo 5/5" },
-      { step: "ROOM_CREATE_ROUNDS", needle: "numero de rodadas" },
-      { step: "ENTER_PASSWORD", needle: "esta sala exige senha" },
-      { step: "ENTER_PASSWORD", needle: "digite a senha" },
-      { step: "ASK_TUTORIAL", needle: "deseja exibir um breve tutorial" },
-      { step: "BOT_ACCESS", needle: "menu – lobby" },
-      { step: "BOT_ACCESS", needle: "o que voce quer fazer" },
-      { step: "BOT_ACCESS", needle: "menu principal" },
-    ];
-
-    let best = null;
-    for (const m of markers) {
-      const i = txt.lastIndexOf(m.needle);
-      if (i < 0) continue;
-      if (!best || i > best.index) best = { step: m.step, index: i };
-    }
-    return best?.step ?? null;
-  };
-
   const inferStepFromLastCompanyPrompt = () => {
     const all = Array.isArray(ctx?.context_all) ? ctx.context_all : [];
     const isCompanyRole = (r) => {
@@ -1285,116 +1355,133 @@ function hydrateStateFromAggregateContext(state, compat) {
       return rr === "company" || rr === "ia" || rr === "equipe" || rr === "assistant";
     };
 
-    // Prioriza o último prompt da empresa imediatamente anterior à última mensagem do cliente.
-    if (all.length) {
-      let seenClient = false;
-      let checkedPreviousCompanyPrompt = false;
-      for (const e of [...all].reverse()) {
-        const role = String(e?.role ?? "").toLowerCase();
-        if (!seenClient && role === "client") {
-          seenClient = true;
-          continue;
-        }
-        if (!seenClient) continue;
-        if (!isCompanyRole(role) || !e?.text) continue;
-        checkedPreviousCompanyPrompt = true;
-        const step = detectStepFromText(e.text);
-        if (step) return step;
-        // Se o prompt imediatamente anterior não indica etapa, não volta para prompts antigos.
-        break;
-      }
-      if (checkedPreviousCompanyPrompt) return null;
-    }
+    const detectStepFromText = (rawText) => {
+      const txt = String(rawText ?? "").toLowerCase();
+      if (!txt) return null;
+      if (txt.includes("alterar nome") || txt.includes("digite o novo nome")) return "SET_NAME";
+      if (txt.includes("passo 1/5") && txt.includes("nome da sala")) return "ROOM_CREATE_NAME";
+      if (txt.includes("passo 2/5") && txt.includes("visibilidade")) return "ROOM_CREATE_VISIBILITY";
+      if (txt.includes("passo 3/5") && txt.includes("definir senha")) return "ROOM_CREATE_PASSWORD";
+      if (txt.includes("passo 4/5") && txt.includes("modo de jogo")) return "ROOM_CREATE_MODE";
+      if (txt.includes("passo 5/5") && txt.includes("número de rodadas")) return "ROOM_CREATE_ROUNDS";
+      if (txt.includes("esta sala exige senha") && txt.includes("digite a senha")) return "ENTER_PASSWORD";
+      if (txt.includes("deseja exibir um breve tutorial")) return "ASK_TUTORIAL";
+      return null;
+    };
 
-    // fallback: procura a última mensagem da empresa que indique passo
-    // (usado apenas quando não há âncora client->company no contexto)
     for (const e of [...all].reverse()) {
       if (!isCompanyRole(e?.role) || !e?.text) continue;
       const step = detectStepFromText(e.text);
       if (step) return step;
     }
 
-    // fallback para pipelines que só entregam context_all_text (transcript único)
     const stepFromTranscript = detectStepFromText(ctx?.context_all_text);
     if (stepFromTranscript) return stepFromTranscript;
 
     return null;
   };
 
-  const normalizeStepName = (stepRaw) => {
-    const step = String(stepRaw ?? "").trim();
-    if (!step) return "";
-    const map = {
-      LOBBY_MENU: "BOT_ACCESS",
-      LOBBY: "BOT_ACCESS",
-      CREATE_STEP_NAME: "ROOM_CREATE_NAME",
-      CREATE_STEP_VIS: "ROOM_CREATE_VISIBILITY",
-      CREATE_STEP_PASS: "ROOM_CREATE_PASSWORD",
-      CREATE_STEP_MODE: "ROOM_CREATE_MODE",
-      CREATE_STEP_ROUNDS: "ROOM_CREATE_ROUNDS",
-      ROOM_START_TUTORIAL_Q: "ASK_TUTORIAL",
-      WAITING_VINC: "ROOM_CREATE_WAIT_VINC",
-    };
-    return map[step] || step;
-  };
+  // Reconstruir salas a partir do datastore (estado_json_raw ou status_json dos participantes)
+  const salasRows = ctx?.datastore?.salas || ctx?.salas_rows || [];
+  
+  for (const salaRow of salasRows) {
+    const salaId = String(salaRow?.sala_id ?? "").trim();
+    if (!salaId || s.rooms[salaId]) continue;
+    
+    // Tentar reconstruir do estado_json_raw
+    let roomObj = null;
+    if (salaRow?.estado_json_raw) {
+      try {
+        roomObj = typeof salaRow.estado_json_raw === "string" 
+          ? JSON.parse(salaRow.estado_json_raw) 
+          : salaRow.estado_json_raw;
+      } catch (e) {}
+    }
+    
+    if (roomObj && roomObj.code) {
+      s.rooms[salaId] = roomObj;
+    }
+  }
+  
+  // Se não conseguimos reconstruir salas do estado_json_raw, tentar do status_json dos participantes
+  const participantesRows = ctx?.datastore?.participantes || ctx?.participantes_rows || [];
+  
+  for (const pRow of participantesRows) {
+    const pSalaId = String(pRow?.sala_id ?? "").trim();
+    if (!pSalaId || pSalaId === "BOT_ACCESS" || s.rooms[pSalaId]) continue;
+    
+    let pStatus = null;
+    try {
+      if (typeof pRow?.status_json === "string" && pRow.status_json.trim()) {
+        pStatus = JSON.parse(pRow.status_json);
+      } else if (pRow?.status_json && typeof pRow.status_json === "object") {
+        pStatus = pRow.status_json;
+      }
+    } catch (e) {}
+    
+    if (pStatus?.runtime?.room && pStatus.runtime.room.code) {
+      const roomInfo = pStatus.runtime.room;
+      // Criar um skeleton da sala a partir das informações do participante
+      s.rooms[pSalaId] = {
+        code: roomInfo.code,
+        status: roomInfo.status || "CREATING",
+        name: roomInfo.name || null,
+        visibility: null,
+        password: null,
+        mode: roomInfo.mode || "CLASSIC",
+        rounds_total: roomInfo.rounds_total || 5,
+        max_players: 8,
+        question_types: { classica: true, vhs: true, manchete: true, instrucao: true },
+        screen_group_id: roomInfo.screen_group_id || null,
+        host_chat_id: roomInfo.host_chat_id || "",
+        players: {},
+        players_order: [],
+        game: {
+          phase: roomInfo.phase || "WAITING",
+          round_index: roomInfo.round_index || 0,
+          mode_runtime: null,
+          waiting_reason: null,
+          last_big_event: null,
+          scores: {},
+          round: null,
+        },
+      };
+    }
+  }
+  
+  // Adicionar participantes às salas reconstruídas
+  for (const pRow of participantesRows) {
+    const pSalaId = String(pRow?.sala_id ?? "").trim();
+    const pChatId = String(pRow?.chat_id ?? "").trim();
+    if (!pSalaId || !pChatId || pSalaId === "BOT_ACCESS") continue;
+    
+    const targetRoom = s.rooms[pSalaId];
+    if (!targetRoom) continue;
+    
+    if (!targetRoom.players[pChatId]) {
+      targetRoom.players[pChatId] = {
+        chat_id: pChatId,
+        name: String(pRow?.nome ?? "Jogador"),
+        is_bot: false,
+      };
+      if (!targetRoom.players_order.includes(pChatId)) {
+        targetRoom.players_order.push(pChatId);
+      }
+      targetRoom.game.scores[pChatId] = targetRoom.game.scores[pChatId] ?? Number(pRow?.pontos ?? 0);
+    }
+    
+    // Atualizar host se necessário
+    if (pRow?.role === "host" && !targetRoom.host_chat_id) {
+      targetRoom.host_chat_id = pChatId;
+    }
+  }
+  
+
 
   const senderId = String(sender?.sender_chat_id ?? ctx?.sender_chat_id ?? "").trim();
   if (!senderId) return s;
 
-  const hydrateRoomFromAggregateRow = (row) => {
-    if (!row || typeof row !== "object") return;
-    let roomObj = null;
-    const rawEstado = row?.estado_json_raw ?? row?.estado_json ?? row?.estado_obj ?? null;
-    try {
-      if (typeof rawEstado === "string" && rawEstado.trim()) roomObj = JSON.parse(rawEstado);
-      else if (rawEstado && typeof rawEstado === "object") roomObj = deepClone(rawEstado);
-    } catch (e) {
-      roomObj = null;
-    }
-
-    const roomCode = String(roomObj?.code ?? roomObj?.sala_id ?? row?.sala_id ?? "").trim();
-    if (!roomCode || roomCode === "BOT_ACCESS") return;
-
-    const existing = s.rooms[roomCode] || {};
-    const merged = {
-      ...existing,
-      ...(roomObj && typeof roomObj === "object" ? roomObj : {}),
-      code: roomCode,
-      name: roomObj?.name ?? roomObj?.sala_nome ?? row?.nome ?? existing?.name ?? null,
-      visibility: roomObj?.visibility ?? roomObj?.visibilidade ?? row?.visibilidade ?? existing?.visibility ?? null,
-      password: roomObj?.password ?? roomObj?.senha ?? row?.senha ?? existing?.password ?? null,
-      max_players: Number(roomObj?.max_players ?? roomObj?.max_jogadores ?? row?.max_jogadores ?? existing?.max_players ?? 8) || 8,
-      rounds_total: Number(roomObj?.rounds_total ?? roomObj?.rodadas_total ?? row?.rodadas_total ?? existing?.rounds_total ?? 5) || 5,
-      host_chat_id: String(roomObj?.host_chat_id ?? row?.host_chat_id ?? existing?.host_chat_id ?? "").trim() || null,
-      status: roomObj?.status ?? existing?.status ?? "IN_ROOM",
-      players: (roomObj?.players && typeof roomObj.players === "object") ? roomObj.players : (existing?.players || {}),
-      players_order: Array.isArray(roomObj?.players_order) ? roomObj.players_order : (existing?.players_order || []),
-      game: (roomObj?.game && typeof roomObj.game === "object") ? roomObj.game : (existing?.game || { phase: "WAITING", round_index: 0, scores: {}, round: null }),
-    };
-
-    if (merged.host_chat_id && !merged.players[merged.host_chat_id]) {
-      merged.players[merged.host_chat_id] = {
-        chat_id: merged.host_chat_id,
-        name: merged.host_chat_id === senderId ? (s.users[senderId]?.name || "Jogador") : "Host",
-        is_bot: false,
-      };
-    }
-    if (merged.host_chat_id && !merged.players_order.includes(merged.host_chat_id)) {
-      merged.players_order = [merged.host_chat_id, ...merged.players_order.filter((x) => x !== merged.host_chat_id)];
-    }
-
-    s.rooms[roomCode] = merged;
-  };
-
-  // Hidrata rooms pelo aggregate para não perder passos entre execuções sem raw.state.
-  const salaRows = [
-    ...(Array.isArray(ctx?.datastore?.salas) ? ctx.datastore.salas : []),
-    ...(Array.isArray(ctx?.salas_rows) ? ctx.salas_rows : []),
-  ];
-  for (const r of salaRows) hydrateRoomFromAggregateRow(r);
-  if (ctx?.datastore?.sala && typeof ctx.datastore.sala === "object") hydrateRoomFromAggregateRow(ctx.datastore.sala);
-  if (ctx?.sala_row && typeof ctx.sala_row === "object") hydrateRoomFromAggregateRow(ctx.sala_row);
-
+  // nome: PRIORIZAR sender (data[1]) - é quem enviou a mensagem!
   const nome = String(sender?.sender_name ?? ctx?.sender_name ?? ctx?.nome ?? "Jogador").trim() || "Jogador";
 
   if (!s.users[senderId]) s.users[senderId] = { name: nome, created_at: Date.now() };
@@ -1419,23 +1506,136 @@ function hydrateStateFromAggregateContext(state, compat) {
   })();
 
   const inferredStep = (() => {
-    const fromStatus = normalizeStepName(parsedStatus?.context?.step);
-    if (fromStatus) return fromStatus;
+    // Primeiro, verificar se há um step no status_json do ctx (do aggregate)
+    const fromStatus = String(parsedStatus?.context?.step ?? "").trim();
+    if (fromStatus) {
+      console.log("[DEBUG hydrateState] inferredStep from status_json:", fromStatus);
+      return fromStatus;
+    }
+    
+    // Verificar status flat
     const fromFlatStatus = String(ctx?.status ?? "").trim().toLowerCase();
-    if (fromFlatStatus === "ativo") return "BOT_ACCESS";
-    if (fromFlatStatus === "inativo") return "BOT_INACTIVE";
-    // Sem status e sem participante persistido => trate como inativo até ativar.
-    if (!hasParticipantInAggregate) return "BOT_INACTIVE";
+    if (fromFlatStatus === "ativo") {
+      console.log("[DEBUG hydrateState] inferredStep from ctx.status = ativo:", "BOT_ACCESS");
+      return "BOT_ACCESS";
+    }
+    if (fromFlatStatus === "inativo") {
+      console.log("[DEBUG hydrateState] inferredStep from ctx.status = inativo:", "BOT_INACTIVE");
+      return "BOT_INACTIVE";
+    }
+    if (!hasParticipantInAggregate) {
+      console.log("[DEBUG hydrateState] inferredStep no participant:", "BOT_INACTIVE");
+      return "BOT_INACTIVE";
+    }
+    console.log("[DEBUG hydrateState] inferredStep default:", "BOT_ACCESS");
     return "BOT_ACCESS";
   })();
 
   const inferredRoom =
     String(parsedStatus?.context?.current_room_code ?? "").trim() ||
+    String(parsedStatus?.runtime?.room?.code ?? "").trim() ||
     String(ctx?.sala_id ?? "").trim();
 
+  // NÃO sobrescrever steps de criação de sala ou entrada de texto
+  // Esses steps devem ser preservados SEMPRE, independentemenete do status
+  const preservedSteps = new Set([
+    "BOT_ACCESS",
+    "BOT_INACTIVE",
+    "IN_ROOM",
+    "ROOM_CREATE_NAME",
+    "ROOM_CREATE_VISIBILITY",
+    "ROOM_CREATE_PASSWORD",
+    "ROOM_CREATE_MODE",
+    "ROOM_CREATE_ROUNDS",
+    "ROOM_CREATE_WAIT_VINC",
+    "SET_NAME",
+    "ENTER_PASSWORD",
+    "CONFIG_SET_PASSWORD",
+    "CONFIG_RENAME",
+    "CONFIG_ROUNDS",
+    "CONFIG_QTYPES",
+    "CONFIG_MAXPLAYERS",
+    "CONFIG_VISIBILITY",
+    "CONFIG_MODE",
+    "CONFIG_ADDBOTS",
+    "CONFIG_KICK",
+    "CONFIG_END_CONFIRM",
+    "ASK_TUTORIAL",
+    "ROOM_CONFIG_MENU",
+    // Steps legados também devem ser preservados
+    "CREATE_STEP_NAME",
+    "CREATE_STEP_VISIBILITY",
+    "CREATE_STEP_PASSWORD",
+    "CREATE_STEP_MODE",
+    "CREATE_STEP_ROUNDS",
+    "CREATE_WAIT_VINC",
+    "LOBBY_MENU",
+    "LOBBY",
+    "BOT_ACTIVE",
+    "ROOM_START_TUTORIAL_Q",
+    "ENTERING_PASSWORD",
+  ]);
+
+  // Obter o contexto existente PRIMEIRO
   const existingCtx = s.user_context[senderId] || {};
+  const existingStep = existingCtx.step;
+  
+  // DEBUG
+  console.log("[DEBUG hydrateState] senderId (from sender):", senderId);
+  console.log("[DEBUG hydrateState] existingCtx:", JSON.stringify(existingCtx));
+  console.log("[DEBUG hydrateState] existingStep:", existingStep);
+  console.log("[DEBUG hydrateState] inferredStep:", inferredStep);
+  console.log("[DEBUG hydrateState] parsedStatus?.context?.step:", parsedStatus?.context?.step);
+  console.log("[DEBUG hydrateState] ctx?.status:", ctx?.status);
+  
+  // Normalizar step existente para verificar se é um step legado
+  const normalizedExistingStep = normalizeLegacyStep(existingStep);
+  
+  // Se já temos um step de criação/input, preservar step E room_code
+  // Importante: fazer isso PRIMEIRO, antes de qualquer outra lógica
+  // Isso é CRÍTICO para SET_NAME, ROOM_CREATE_*, etc.
+  if (normalizedExistingStep && preservedSteps.has(normalizedExistingStep)) {
+    console.log("[DEBUG hydrateState] PRESERVING step:", normalizedExistingStep);
+    // Preservar o step existente SEM alterar - retornar imediatamente
+    // Não fazer mais nenhuma modificação no step!
+    return s;
+  }
+
+  // Caso contrário, usar a lógica normal
+  
+  // Steps que indicam que o usuário está em um fluxo de input de texto
+  // e NÃO devem ser sobrescritos por ctx?.status === "ativo"
+  const textInputFlowSteps = new Set([
+    "SET_NAME",
+    "ROOM_CREATE_NAME",
+    "ROOM_CREATE_VISIBILITY",
+    "ROOM_CREATE_PASSWORD",
+    "ROOM_CREATE_MODE",
+    "ROOM_CREATE_ROUNDS",
+    "ROOM_CREATE_WAIT_VINC",
+    "ENTER_PASSWORD",
+    "CONFIG_SET_PASSWORD",
+    "CONFIG_ROUNDS",
+    "CONFIG_QTYPES",
+    "CONFIG_MAXPLAYERS",
+    "CONFIG_VISIBILITY",
+    "CONFIG_MODE",
+    "CONFIG_END_CONFIRM",
+    "ASK_TUTORIAL",
+    "ROOM_CONFIG_MENU",
+    "IN_ROOM",
+    // Steps legados
+    "CREATE_STEP_NAME",
+    "CREATE_STEP_VISIBILITY",
+    "CREATE_STEP_PASSWORD",
+    "CREATE_STEP_MODE",
+    "CREATE_STEP_ROUNDS",
+    "CREATE_WAIT_VINC",
+    "LOBBY_MENU",
+  ]);
+  
   s.user_context[senderId] = {
-    step: existingCtx.step || inferredStep,
+    step: existingStep || inferredStep,
     current_room_code:
       existingCtx.current_room_code != null
         ? existingCtx.current_room_code
@@ -1447,20 +1647,35 @@ function hydrateStateFromAggregateContext(state, compat) {
     ...(parsedStatus?.context && typeof parsedStatus.context === "object" ? parsedStatus.context : {}),
   };
 
-  // Se veio contexto explícito ativo/inativo no payload de datastore, ele prevalece.
-  if (ctx?.status === "ativo") s.user_context[senderId].step = "BOT_ACCESS";
-  if (ctx?.status === "inativo") s.user_context[senderId].step = "BOT_INACTIVE";
-
-  // Se o datastore ainda não refletiu o último step, tenta inferir pelo último prompt da empresa.
-  // Não sobrescreve BOT_INACTIVE inferido por ausência de participante no aggregate.
-  const fromFlatStatusNorm = String(ctx?.status ?? "").trim().toLowerCase();
-  const canApplyHint = !(inferredStep === "BOT_INACTIVE" && !hasParticipantInAggregate) && fromFlatStatusNorm !== "inativo";
-  if (canApplyHint) {
-    const hintedStep = inferStepFromLastCompanyPrompt();
-    if (hintedStep) s.user_context[senderId].step = hintedStep;
+  // Verificar se o step atual (após merge) é um step de fluxo de input
+  const mergedStep = s.user_context[senderId].step;
+  console.log("[DEBUG hydrateState] mergedStep:", mergedStep);
+  console.log("[DEBUG hydrateState] textInputFlowSteps.has(mergedStep):", textInputFlowSteps.has(mergedStep));
+  
+  // Só aplicar ctx?.status se o step atual NÃO é um fluxo de input
+  if (!textInputFlowSteps.has(mergedStep)) {
+    console.log("[DEBUG hydrateState] Applying ctx.status override:", ctx?.status);
+    if (ctx?.status === "ativo") s.user_context[senderId].step = "BOT_ACCESS";
+    if (ctx?.status === "inativo") s.user_context[senderId].step = "BOT_INACTIVE";
+  } else {
+    console.log("[DEBUG hydrateState] Skipping ctx.status override - step is in textInputFlowSteps");
   }
 
-  s.user_context[senderId].step = normalizeStepName(s.user_context[senderId].step);
+  if (ctx?.status !== "inativo") {
+    // Só inferir step se não estamos em um fluxo de criação/input
+    const currentStep = s.user_context[senderId].step;
+    if (!textInputFlowSteps.has(currentStep) && currentStep !== "BOT_ACCESS" && currentStep !== "BOT_INACTIVE") {
+      const hintedStep = inferStepFromLastCompanyPrompt();
+      if (hintedStep) s.user_context[senderId].step = hintedStep;
+    } else if (currentStep === "BOT_ACCESS") {
+      // Se estamos em BOT_ACCESS, tentar inferir do histórico de conversa
+      // (pode ser que o status_json não tenha sido atualizado ainda)
+      const hintedStep = inferStepFromLastCompanyPrompt();
+      if (hintedStep && textInputFlowSteps.has(hintedStep)) {
+        s.user_context[senderId].step = hintedStep;
+      }
+    }
+  }
 
   return s;
 }
@@ -1468,7 +1683,39 @@ function hydrateStateFromAggregateContext(state, compat) {
 const input = $input.all();
 const raw = input[0]?.json ?? {};
 const compat = normalizeInputAggregate(raw);
-const message = deepClone(raw.message || compat.msg || {});
+
+// Extrair sender para debug (sender = data[1])
+const dataArr = raw?.data;
+const sender = Array.isArray(dataArr) ? (dataArr[1] || {}) : {};
+const ctx = Array.isArray(dataArr) ? (dataArr[0] || {}) : {};
+
+// DEBUG: Mostrar o que chegou no input
+console.log("[DEBUG INPUT] raw.data.length:", dataArr?.length);
+console.log("[DEBUG INPUT] sender (data[1]):", JSON.stringify(sender).slice(0, 300));
+console.log("[DEBUG INPUT] ctx (data[0]):", JSON.stringify(ctx).slice(0, 300));
+
+// Garantir que chat_type seja preservado de raw.message se existir
+// PRIORIZAR compat.msg (extraído do sender/data[1]) - dados atuais da mensagem
+// raw.message pode ter dados desatualizados do ctx anterior
+const rawMessageChatType = raw.message?.chat_type;
+const message = deepClone(compat.msg || raw.message || {});
+
+// Se raw.message tinha chat_type, preservar
+if (rawMessageChatType) {
+  message.chat_type = rawMessageChatType;
+}
+
+// DEBUG: Log da message recebida
+console.log("[DEBUG main] sender (data[1]):", JSON.stringify(sender).slice(0, 200));
+console.log("[DEBUG main] raw.message (data[0]):", JSON.stringify(raw.message || {}).slice(0, 200));
+console.log("[DEBUG main] compat.msg (from sender):", JSON.stringify(compat.msg || {}).slice(0, 200));
+console.log("[DEBUG main] rawMessageChatType:", rawMessageChatType);
+console.log("[DEBUG main] message.chat_type:", message.chat_type);
+console.log("[DEBUG main] message.sender_chat_id:", message.sender_chat_id);
+console.log("[DEBUG main] message.sender_name:", message.sender_name);
+console.log("[DEBUG main] message.text:", message.text?.slice(0, 100));
+console.log("[DEBUG main] === FIM DEBUG ===");
+
 let state = ensureStateBase(raw.state || compat.st || {});
 state = hydrateStateFromAggregateContext(state, compat);
 const actions = [];
@@ -1479,13 +1726,29 @@ const chat_type = message.chat_type;
 const chat_id = String(message.chat_id ?? "");
 const textRaw = String(message.text ?? "").trim();
 
+// DEBUG: Log do step atual
+const debugStep = state?.user_context?.[sender_chat_id]?.step;
+console.log("[DEBUG] Mensagem:", textRaw);
+console.log("[DEBUG] Step atual DO STATE:", debugStep);
+console.log("[DEBUG] Room code:", state?.user_context?.[sender_chat_id]?.current_room_code);
+
 if (!sender_chat_id || !chat_id || !chat_type) {
   return buildOutput(state, [], { error: "missing message fields", got: message }, message);
 }
 
 const profile = getUserProfile(state, sender_chat_id, sender_name);
 const uctx = getUserCtx(state, sender_chat_id);
-const parsed = parseIncoming(message, state);
+
+// Normalizar step atual para reconhecer steps legados
+if (uctx.step) {
+  const normalized = normalizeLegacyStep(uctx.step);
+  if (normalized !== uctx.step) {
+    console.log("[DEBUG] Normalizing step:", uctx.step, "->", normalized);
+    uctx.step = normalized;
+  }
+}
+
+const parsed = parseIncoming(message);
 
 uctx.last_seen_at = Date.now();
 uctx.last_seen_chat_type = String(chat_type || "");
@@ -1504,38 +1767,37 @@ function getRoomByCode(code) {
   return state.rooms[code] || null;
 }
 
-function reconcileStepFromCreatingRoom() {
-  const code = findUserRoomCode();
-  const room = code ? getRoomByCode(code) : null;
-  if (!room) return;
-  if (room.status !== "CREATING") return;
-  if (!isHost(room, sender_chat_id)) return;
-
-  // Evita perder o passo quando o aggregate vem sem status_json recente.
-  uctx.current_room_code = room.code;
-
-  if (!room.name) {
-    uctx.step = "ROOM_CREATE_NAME";
-    return;
-  }
-  if (!room.visibility) {
-    uctx.step = "ROOM_CREATE_VISIBILITY";
-    return;
-  }
-  if ((room.visibility === "privada" || room.visibility === "oculta") && !room.password) {
-    uctx.step = "ROOM_CREATE_PASSWORD";
-    return;
-  }
+if (parsed.kind === "IGNORED_GROUP") {
+  // Mostrar instruções no lobby do grupo
+  actions.push(actionSend({ 
+    channel: "group", 
+    chat_id: parsed.chat_id, 
+    text: [
+      "📋✨ FIBBAGE – INSTRUÇÕES",
+      "",
+      "┌─ PARTICIPAR DO JOGO ─",
+      "│",
+      "│ 1️⃣  No privado do bot, envie: ,ativarbot",
+      "│",
+      "│ 2️⃣  Depois, envie: entrar XX",
+      "│     (XX = código da sala)",
+      "│",
+      "└────────────────────────",
+      "",
+      "💡 Dúvidas? Chame o bot no privado!",
+    ].join("\n")
+  }));
+  return buildOutput(state, actions, { ignored_group: true }, message);
 }
-
-reconcileStepFromCreatingRoom();
-
-if (parsed.kind === "IGNORED_GROUP") return buildOutput(state, [], { ignored_group: true }, message);
 
 if (parsed.kind === "VINC") {
   const code = parsed.code;
   const room = getRoomByCode(code);
-  if (!room) return buildOutput(state, [], { vinc: "room_not_found", code }, message);
+  if (!room) {
+    // Código inválido - informar ao host
+    actions.push(actionSend({ channel: "group", chat_id: parsed.chat_id, text: `⚠️ Código de sala inválido: ${code}\n\nVerifique o código e tente novamente.` }));
+    return buildOutput(state, actions, { vinc: "room_not_found", code }, message);
+  }
 
   room.screen_group_id = parsed.chat_id;
   if (room.status === "CREATING") {
@@ -1544,9 +1806,25 @@ if (parsed.kind === "VINC") {
     room.game.mode_runtime = room.mode;
   }
 
+  // Definir step e current_room_code para o host
+  uctx.step = "IN_ROOM";
+  uctx.current_room_code = code;
+
   ensureScoreCfg(room);
 
-  actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: "📺✨ TELÃO VINCULADO COM SUCESSO!\n\n" + roomPanelText(room) }));
+  // Enviar instrução simplificada no grupo
+  actions.push(actionSend({ 
+    channel: "group", 
+    chat_id: room.screen_group_id, 
+    text: "📺✨ TELÃO VINCULADO COM SUCESSO!\n\n" + roomPanelText(room) + "\n\n" + [
+      "📝 Para participar, cada jogador deve:",
+      "",
+      "1️⃣ No privado do bot, enviar: ,ativarbot",
+      "2️⃣ Depois, enviar: entrar " + room.code,
+      "",
+      "🎯 O host controla o jogo com comandos no grupo!"
+    ].join("\n")
+  }));
   actions.push(
     actionSend({
       channel: "private",
@@ -1579,8 +1857,32 @@ if (parsed.kind === "GROUP_CMD") {
   const roomCode = findUserRoomCode();
   const room = roomCode ? getRoomByCode(roomCode) : null;
 
-  if (!room || !room.screen_group_id || room.screen_group_id !== parsed.chat_id) return buildOutput(state, [], { group_cmd: "no_room_match", cmd }, message);
-  if (!isHost(room, parsed.sender_chat_id)) return buildOutput(state, [], { group_cmd: "not_host_ignored", cmd }, message);
+  // Debug info
+  console.log("[DEBUG GROUP_CMD] roomCode:", roomCode);
+  console.log("[DEBUG GROUP_CMD] room:", room ? room.code : null);
+  console.log("[DEBUG GROUP_CMD] room.screen_group_id:", room?.screen_group_id);
+  console.log("[DEBUG GROUP_CMD] parsed.chat_id:", parsed.chat_id);
+  
+  if (!room) {
+    // Room not found - try to find by screen group
+    const roomByGroup = Object.values(state.rooms || {}).find(r => r.screen_group_id === parsed.chat_id);
+    if (roomByGroup) {
+      console.log("[DEBUG GROUP_CMD] Found room by screen_group_id:", roomByGroup.code);
+      actions.push(actionSend({ channel: "group", chat_id: parsed.chat_id, text: "⚠️ Comando reconhecido, mas preciso processar..." }));
+    } else {
+      actions.push(actionSend({ channel: "group", chat_id: parsed.chat_id, text: "⚠️ Nenhuma sala vinculada a este grupo. Use o comando no privado com o bot para criar ou entrar em uma sala." }));
+      return buildOutput(state, actions, { group_cmd: "no_room_found" }, message);
+    }
+  }
+
+  if (!room || !room.screen_group_id || room.screen_group_id !== parsed.chat_id) {
+    actions.push(actionSend({ channel: "group", chat_id: parsed.chat_id, text: "⚠️ Este grupo não está vinculado a nenhuma sala. O host precisa criar uma sala e vinculá-la." }));
+    return buildOutput(state, actions, { group_cmd: "no_room_match", cmd }, message);
+  }
+  if (!isHost(room, parsed.sender_chat_id)) {
+    // Não é host - ignorar completamente, não responder
+    return buildOutput(state, [], { group_cmd: "not_host_ignored", cmd }, message);
+  }
 
   ensureScoreCfg(room);
 
@@ -1628,127 +1930,56 @@ if (parsed.kind === "PRIVATE_TEXT") {
   uctx.last_private_cmd = String(c?.cmd ?? "text");
   uctx.last_private_cmd_at = Date.now();
 
-  // Durante passos que aguardam texto livre, não interpretar como comando de menu.
+  // Verificar se já existe uma sala em criação antes de criar nova
+  if (c.cmd === "criar") {
+    // Verificar se há salas em criação no state (já hydratado a partir do datastore)
+    const stateCreatingRooms = Object.values(state.rooms || {}).filter(
+      r => r.status === "CREATING" && r.host_chat_id !== sender_chat_id
+    );
+    
+    if (stateCreatingRooms.length > 0) {
+      actions.push(actionSend({ 
+        channel: "private", 
+        chat_id: sender_chat_id, 
+        text: "⚠️ No momento, outra sala está sendo criada por outro jogador.\n\nAguarde um momento e tente novamente, ou entre em uma sala existente:\n\nDigite salas para ver as disponíveis." 
+      }));
+      return buildOutput(state, actions, { criar: "blocked_other_creation" }, message);
+    }
+  }
+
   const textInputSteps = new Set([
     "SET_NAME",
     "ROOM_CREATE_NAME",
     "ROOM_CREATE_PASSWORD",
+    "ROOM_CREATE_VISIBILITY",
+    "ROOM_CREATE_MODE",
+    "ROOM_CREATE_ROUNDS",
+    "ROOM_CREATE_WAIT_VINC",
     "ENTER_PASSWORD",
     "CONFIG_SET_PASSWORD",
+    "CONFIG_RENAME",
+    "CONFIG_ROUNDS",
+    "CONFIG_QTYPES",
+    "CONFIG_MAXPLAYERS",
+    "CONFIG_VISIBILITY",
+    "CONFIG_MODE",
+    "CONFIG_ADDBOTS",
+    "CONFIG_KICK",
+    // Steps legados também precisam ser reconhecidos
+    "CREATE_STEP_NAME",
+    "CREATE_STEP_VISIBILITY",
+    "CREATE_STEP_PASSWORD",
+    "CREATE_STEP_MODE",
+    "CREATE_STEP_ROUNDS",
+    "CREATE_WAIT_VINC",
+    "ROOM_START_TUTORIAL_Q",
+    "ENTERING_PASSWORD",
   ]);
-  if (textInputSteps.has(String(uctx.step ?? "")) && c.cmd !== "text") {
-    c = { cmd: "text", text: String(parsed.text ?? "").trim() };
-  }
-
-  if (c.cmd === "text" && normalizeAnswerText(c.text) === ",ativarbot") {
-    if (uctx.step !== "BOT_INACTIVE") {
-      const activeRoomCode = findUserRoomCode();
-      if (activeRoomCode) {
-        uctx.current_room_code = activeRoomCode;
-        uctx.step = "IN_ROOM";
-        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "✅ O bot já está ativo para você. Continuando de onde parou na sala." }));
-      } else {
-        uctx.step = "BOT_ACCESS";
-        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "✅ O bot já está ativo para você." }));
-      }
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText(), delay_seconds: 0 }));
-      return buildOutput(state, actions, { activated: "already_active" }, message);
-    }
-
-    uctx.step = "BOT_ACCESS";
-    uctx.current_room_code = null;
-
-    actions.push(
-      actionSend({
-        channel: "private",
-        chat_id: sender_chat_id,
-        text: [
-          "🤖✨ Bot ativado com sucesso!",
-          "",
-          "Bem-vindo ao Servidor Oficial do Fibbage 🎉🎲",
-          "Você está no Lobby — ainda não está em nenhuma sala.",
-        ].join("\n"),
-      }),
-    );
-
-    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText() }));
-    return buildOutput(state, actions, { activated: true }, message);
-  }
-
-  if (c.cmd === "desativarbot" || (c.cmd === "text" && normalizeAnswerText(c.text) === ",desativarbot")) {
-    uctx.step = "BOT_INACTIVE";
-    uctx.current_room_code = null;
-    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "🛑 Bot desativado. Para voltar a jogar, envie ,ativarbot." }));
-    return buildOutput(state, actions, { deactivated: true }, message);
-  }
-
-  if (uctx.step === "BOT_INACTIVE") {
-    actions.push(
-      actionSend({
-        channel: "private",
-        chat_id: sender_chat_id,
-        text: "🤖 O bot está desativado para você. Envie ,ativarbot para voltar ao Lobby.",
-      }),
-    );
-    return buildOutput(state, actions, { inactive_ignored: true }, message);
-  }
-
-  if (c.cmd === "menu") {
-    uctx.step = "BOT_ACCESS";
-    uctx.current_room_code = null;
-    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText() }));
-    return buildOutput(state, actions, { menu: true }, message);
-  }
-
-  if (c.cmd === "salas") {
-    const activeRoomCode = findUserRoomCode();
-    if (activeRoomCode) {
-      uctx.step = "IN_ROOM";
-      uctx.current_room_code = activeRoomCode;
-    } else {
-      uctx.step = "BOT_ACCESS";
-      uctx.current_room_code = null;
-    }
-    uctx.last_action = "salas_listed";
-
-    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: listRoomsText(state) }));
-    return buildOutput(state, actions, { salas: true }, message);
-  }
-
-  if (c.cmd === "nome") {
-    const inlineName = String(c.name ?? "").trim().slice(0, 20);
-    if (inlineName) {
-      profile.name = inlineName;
-      uctx.step = "BOT_ACCESS";
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome alterado com sucesso!\n\n🎭 Agora você é: ${inlineName}` }));
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText(), delay_seconds: 0 }));
-      return buildOutput(state, actions, { set_name: "ok_inline" }, message);
-    }
-
-    uctx.step = "SET_NAME";
-    actions.push(
-      actionSend({
-        channel: "private",
-        chat_id: sender_chat_id,
-        text: `🪪 ALTERAR NOME\n\nSeu nome atual é:\n${profile.name}\n\nDigite o novo nome que deseja usar 👇\n\n(Máximo 20 caracteres)`,
-      }),
-    );
-    return buildOutput(state, actions, { set_name: "prompt" }, message);
-  }
-
-  if (uctx.step === "SET_NAME" && c.cmd === "text") {
-    const newName = String(c.text ?? "").trim().slice(0, 20);
-    if (!newName) {
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Nome inválido. Digite um nome com pelo menos 1 caractere." }));
-      return buildOutput(state, actions, { set_name: "invalid" }, message);
-    }
-    profile.name = newName;
-    uctx.step = "BOT_ACCESS";
-    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome alterado com sucesso!\n\n🎭 Agora você é: ${newName}` }));
-    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText(), delay_seconds: 0 }));
-    return buildOutput(state, actions, { set_name: "ok" }, message);
-  }
-
+  
+  // ANTES de converter comandos para texto, verificar comandos especiais primeiro!
+  // Isso evita que "criar", "menu", etc sejam tratados como texto em SET_NAME
+  
+  // 处理 "criar" 命令 - 必须先于文本转换
   if (c.cmd === "criar") {
     const code = allocateRoomCode(state);
     const room = createRoomSkeleton({ code, host_chat_id: sender_chat_id, host_name: profile.name });
@@ -1778,6 +2009,53 @@ if (parsed.kind === "PRIVATE_TEXT") {
     return buildOutput(state, actions, { criar: "started", code }, message);
   }
 
+  // 处理 "menu" 命令
+  if (c.cmd === "menu") {
+    uctx.step = "BOT_ACCESS";
+    uctx.current_room_code = null;
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText() }));
+    return buildOutput(state, actions, { menu: true }, message);
+  }
+
+  // 处理 "salas" 命令
+  if (c.cmd === "salas") {
+    const activeRoomCode = findUserRoomCode();
+    if (activeRoomCode) {
+      uctx.step = "IN_ROOM";
+      uctx.current_room_code = activeRoomCode;
+    } else {
+      uctx.step = "BOT_ACCESS";
+      uctx.current_room_code = null;
+    }
+    uctx.last_action = "salas_listed";
+
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: listRoomsText(state) }));
+    return buildOutput(state, actions, { salas: true }, message);
+  }
+
+  // 处理 "nome" 命令
+  if (c.cmd === "nome") {
+    const inlineName = String(c.name ?? "").trim().slice(0, 20);
+    if (inlineName) {
+      profile.name = inlineName;
+      uctx.step = "BOT_ACCESS";
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome alterado com sucesso!\n\n🎭 Agora você é: ${inlineName}` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText(), delay_seconds: 0 }));
+      return buildOutput(state, actions, { set_name: "ok_inline" }, message);
+    }
+
+    uctx.step = "SET_NAME";
+    actions.push(
+      actionSend({
+        channel: "private",
+        chat_id: sender_chat_id,
+        text: `🪪 ALTERAR NOME\n\nSeu nome atual é:\n${profile.name}\n\nDigite o novo nome que deseja usar 👇\n\n(Máximo 20 caracteres)`,
+      }),
+    );
+    return buildOutput(state, actions, { set_name: "prompt" }, message);
+  }
+
+  // 处理 "entrar" 命令
   if (c.cmd === "entrar") {
     const code = c.code;
     const room = getRoomByCode(code);
@@ -1806,77 +2084,263 @@ if (parsed.kind === "PRIVATE_TEXT") {
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: `👤✨ ${profile.name} entrou na sala!` }));
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: roomPanelText(room), delay_seconds: 1 }));
       actions.push(actionSend({ channel: "private", chat_id: room.host_chat_id, text: `👥 Atualização da sala!\n\n${profile.name} entrou.\nOlhe no telão para o painel atualizado.` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Você entrou na sala ${room.name}.\n\n💡 Para alterar seu nome, digite: nome\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.` }));
     } else {
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "✅ Você entrou na sala.\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular." }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Você entrou na sala ${room.name}.\n\n💡 Para alterar seu nome, digite: nome\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.` }));
     }
 
     return buildOutput(state, actions, { entrar: "ok_public", code }, message);
   }
 
+  // 处理 "desativarbot" 命令
+  if (c.cmd === "desativarbot" || (c.cmd === "text" && normalizeAnswerText(c.text) === ",desativarbot")) {
+    uctx.step = "BOT_INACTIVE";
+    uctx.current_room_code = null;
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "🛑 Bot desativado. Para voltar a jogar, envie ,ativarbot." }));
+    return buildOutput(state, actions, { deactivated: true }, message);
+  }
+
+  // 处理 "ativarbot" 命令
+  if (c.cmd === "text" && normalizeAnswerText(c.text) === ",ativarbot") {
+    // Se o step não existe ou não está definido, é ativação pela primeira vez
+    const currentStep = uctx.step;
+    const isFirstTime = !currentStep || currentStep === "BOT_INACTIVE" || currentStep === undefined || currentStep === null;
+    
+    if (!isFirstTime && currentStep !== "BOT_INACTIVE") {
+      // Já está ativo
+      const activeRoomCode = findUserRoomCode();
+      if (activeRoomCode) {
+        uctx.current_room_code = activeRoomCode;
+        uctx.step = "IN_ROOM";
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "✅ O bot já está ativo para você. Continuando de onde parou na sala." }));
+      } else {
+        uctx.step = "BOT_ACCESS";
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "✅ O bot já está ativo para você." }));
+      }
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText(), delay_seconds: 0 }));
+      return buildOutput(state, actions, { activated: "already_active" }, message);
+    }
+
+    // Primeira vez ativando o bot
+    uctx.step = "BOT_ACCESS";
+    uctx.current_room_code = null;
+
+    actions.push(
+      actionSend({
+        channel: "private",
+        chat_id: sender_chat_id,
+        text: [
+          "🤖✨ Bot ativado com sucesso!",
+          "",
+          `👤 Você está jogando como: ${profile.name}`,
+          "",
+          "Bem-vindo ao Servidor Oficial do Fibbage 🎉🎲",
+          "Você está no Lobby — ainda não está em nenhuma sala.",
+          "",
+          "💡 Para alterar seu nome a qualquer momento, digite: nome",
+        ].join("\n"),
+      }),
+    );
+
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText() }));
+    return buildOutput(state, actions, { activated: true }, message);
+  }
+
+  // Se o usuário está em um step que exige texto livre (SET_NAME, ROOM_CREATE_NAME, etc.),
+  // converter input para texto. Mas NÃO fazer isso para steps que esperam NÚMEROS!
+  const textOnlySteps = new Set([
+    "SET_NAME",
+    "ROOM_CREATE_NAME",
+    "ROOM_CREATE_PASSWORD",
+    "ENTER_PASSWORD",
+    "CONFIG_SET_PASSWORD",
+    "CONFIG_RENAME",
+  ]);
+  
+  if (textOnlySteps.has(String(uctx.step ?? "")) && c.cmd !== "text") {
+    c = { cmd: "text", text: String(parsed.text ?? "").trim() };
+  }
+
+  if (uctx.step === "BOT_INACTIVE") {
+    actions.push(
+      actionSend({
+        channel: "private",
+        chat_id: sender_chat_id,
+        text: "🤖 O bot está desativado para você. Envie ,ativarbot para voltar ao Lobby.",
+      }),
+    );
+    return buildOutput(state, actions, { inactive_ignored: true }, message);
+  }
+
+  // Obter room para os próximos handlers (config, jogo, etc.)
+  const activeRoomCode2 = uctx.current_room_code || findUserRoomCode();
+  const room = activeRoomCode2 ? getRoomByCode(activeRoomCode2) : null;
+
+  console.log("[DEBUG] === INÍCIO DOS HANDLERS ===");
+  console.log("[DEBUG] uctx.step:", uctx.step);
+  console.log("[DEBUG] uctx.current_room_code:", uctx.current_room_code);
+  console.log("[DEBUG] activeRoomCode2 (from findUserRoomCode):", activeRoomCode2);
+  console.log("[DEBUG] room found:", room ? room.code : null);
+  console.log("[DEBUG] room.status:", room?.status);
+  console.log("[DEBUG] isHost(room, sender_chat_id):", room ? isHost(room, sender_chat_id) : null);
+  console.log("[DEBUG] c.cmd:", c.cmd);
+  console.log("[DEBUG] ========================");
+
+  // Handler para CONFIG_RENAME - ALTERAR NOME DA SALA
+  if (room && uctx.step === "CONFIG_RENAME" && isHost(room, sender_chat_id) && c.cmd === "text") {
+    const newName = String(c.text ?? "").trim().slice(0, 25);
+    if (!newName) {
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Nome inválido. Digite o nome da sala 👇" }));
+      return buildOutput(state, actions, { rename: "invalid" }, message);
+    }
+    room.name = newName;
+    afterBigEventPause(room);
+    uctx.step = "ROOM_CONFIG_MENU";
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome da sala alterado para: ${newName}` }));
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
+    return buildOutput(state, actions, { rename: "ok" }, message);
+  }
+
+  // Handler para CONFIG_VISIBILITY - ALTERAR VISIBILIDADE (vem antes de SET_NAME!)
+  if (room && uctx.step === "CONFIG_VISIBILITY" && isHost(room, sender_chat_id) && c.cmd === "number") {
+    if (c.n === 0) {
+      uctx.step = "ROOM_CONFIG_MENU";
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room) }));
+      return buildOutput(state, actions, { vis: "back" }, message);
+    }
+    if (![1, 2, 3].includes(c.n)) {
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Digite 1, 2, 3 ou 0 👇" }));
+      return buildOutput(state, actions, { vis: "invalid" }, message);
+    }
+
+    const newVis = c.n === 1 ? "publica" : c.n === 2 ? "privada" : "oculta";
+    room.visibility = newVis;
+    if (newVis === "publica") {
+      room.password = null;
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "✅ Sala agora está Pública (sem senha)." }));
+      afterBigEventPause(room);
+      uctx.step = "ROOM_CONFIG_MENU";
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
+      return buildOutput(state, actions, { vis: "public_ok" }, message);
+    }
+
+    uctx.step = "CONFIG_SET_PASSWORD";
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "🔐 Esta visibilidade exige senha.\n\nDigite a nova senha 👇\n\n(Mínimo 4 caracteres)" }));
+    return buildOutput(state, actions, { vis: "ask_pwd" }, message);
+  }
+
+  // Handler para SET_NAME - quando usuário está alterando nome
+  // Este handler só deve ser executado se NÃO estiver em uma sala
+  if (uctx.step === "SET_NAME" && !room) {
+    console.log("[DEBUG] Entrou no handler SET_NAME, cmd:", c.cmd);
+    
+    if (c.cmd === "text") {
+      const newName = String(c.text ?? "").trim().slice(0, 20);
+      if (!newName) {
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Nome inválido. Digite um nome válido 👇" }));
+        return buildOutput(state, actions, { set_name: "invalid" }, message);
+      }
+      profile.name = newName;
+      uctx.step = "BOT_ACCESS";
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome alterado com sucesso!\n\n🎭 Agora você é: ${newName}` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText(), delay_seconds: 0 }));
+      console.log("[DEBUG] SET_NAME completo, step alterado para BOT_ACCESS");
+      return buildOutput(state, actions, { set_name: "ok" }, message);
+    } else {
+      // Se recebeu comando em vez de texto no step SET_NAME, mostrar mensagem de erro
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Digite o nome que deseja usar (texto livre) 👇" }));
+      return buildOutput(state, actions, { set_name: "need_text" }, message);
+    }
+  }
+
+  // Handler para ENTER_PASSWORD - quando usuário está entrando em sala com senha
   if (uctx.step === "ENTER_PASSWORD" && c.cmd === "text") {
     const code = uctx.current_room_code;
     const room = getRoomByCode(code);
     if (!room) {
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Erro: sala não encontrada." }));
       uctx.step = "BOT_ACCESS";
       uctx.current_room_code = null;
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Sala não encontrada." }));
-      return buildOutput(state, actions, { enter_password: "room_missing" }, message);
+      return buildOutput(state, actions, { enter_password: "room_not_found" }, message);
     }
-
-    const pass = String(c.text ?? "").trim();
-    if (pass !== String(room.password ?? "")) {
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Senha incorreta. Tente novamente 👇" }));
-      return buildOutput(state, actions, { enter_password: "wrong" }, message);
+    const enteredPassword = String(c.text ?? "").trim();
+    if (enteredPassword !== room.password) {
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "🔐 Senha incorreta. Tente novamente 👇" }));
+      return buildOutput(state, actions, { enter_password: "wrong_password" }, message);
     }
-
-    if (!room.players[sender_chat_id] && room.players_order.length >= room.max_players) {
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Sala cheia no momento." }));
-      return buildOutput(state, actions, { enter_password: "room_full", code }, message);
-    }
-
+    // Senha correta - entrar na sala
     ensureUserInRoom(state, sender_chat_id, code);
     uctx.step = "IN_ROOM";
-    uctx.current_room_code = code;
-
     if (room.screen_group_id) {
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: `👤✨ ${profile.name} entrou na sala!` }));
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: roomPanelText(room), delay_seconds: 1 }));
       actions.push(actionSend({ channel: "private", chat_id: room.host_chat_id, text: `👥 Atualização da sala!\n\n${profile.name} entrou.\nOlhe no telão para o painel atualizado.` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Você entrou na sala ${room.name}.\n\n💡 Para alterar seu nome, digite: nome\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.` }));
     } else {
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "✅ Você entrou na sala.\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular." }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Você entrou na sala ${room.name}.\n\n💡 Para alterar seu nome, digite: nome\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.` }));
     }
-
-    return buildOutput(state, actions, { enter_password: "ok" }, message);
+    return buildOutput(state, actions, { entrar: "ok_private", code }, message);
   }
 
-  const roomCode = findUserRoomCode();
-  const room = roomCode ? getRoomByCode(roomCode) : null;
-
-  if (room && room.status === "CREATING" && isHost(room, sender_chat_id)) {
-    if (uctx.step === "ROOM_CREATE_NAME" && c.cmd === "text") {
-      room.name = String(c.text ?? "").trim().slice(0, 25);
-      uctx.step = "ROOM_CREATE_VISIBILITY";
-      actions.push(
-        actionSend({
-          channel: "private",
-          chat_id: sender_chat_id,
-          text: [
-            `🎲 Nome definido: ${room.name}`,
-            "",
-            "━━━━━━━━━━━━━━━",
-            "🔓 Passo 2/5 — Visibilidade",
-            "",
-            "1️⃣ Pública",
-            "2️⃣ Privada (exige senha)",
-            "3️⃣ Oculta (não aparece na lista e exige senha)",
-            "",
-            "Digite o número 👇",
-          ].join("\n"),
-        }),
-      );
-      return buildOutput(state, actions, { create_name: "ok" }, message);
+  // Handler para ROOM_CREATE_NAME - quando usuário está criando sala e digita o nome
+  if (uctx.step === "ROOM_CREATE_NAME" && c.cmd === "text") {
+    const roomCode = uctx.current_room_code;
+    const room = getRoomByCode(roomCode);
+    if (!room) {
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Erro: sala não encontrada. Digite criar para começar novamente." }));
+      uctx.step = "BOT_ACCESS";
+      uctx.current_room_code = null;
+      return buildOutput(state, actions, { create_name: "room_not_found" }, message);
     }
+    room.name = String(c.text ?? "").trim().slice(0, 25);
+    if (!room.name) {
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Nome inválido. Digite o nome da sala 👇" }));
+      return buildOutput(state, actions, { create_name: "invalid" }, message);
+    }
+    uctx.step = "ROOM_CREATE_VISIBILITY";
+    actions.push(
+      actionSend({
+        channel: "private",
+        chat_id: sender_chat_id,
+        text: [
+          `🎲 Nome definido: ${room.name}`,
+          "",
+          "━━━━━━━━━━━━━━━",
+          "🔓 Passo 2/5 — Visibilidade",
+          "",
+          "1️⃣ Pública",
+          "2️⃣ Privada (exige senha)",
+          "3️⃣ Oculta (não aparece na lista e exige senha)",
+          "",
+          "Digite o número 👇",
+        ].join("\n"),
+      }),
+    );
+    return buildOutput(state, actions, { create_name: "ok" }, message);
+  }
 
+  // Obter room para os próximos handlers
+  const roomCodeForSteps = uctx.current_room_code;
+  const roomForSteps = roomCodeForSteps ? getRoomByCode(roomCodeForSteps) : null;
+
+  console.log("[DEBUG] Room code for steps:", roomCodeForSteps);
+  console.log("[DEBUG] Room for steps:", roomForSteps ? roomForSteps.code : null);
+  console.log("[DEBUG] uctx.step:", uctx.step);
+  console.log("[DEBUG] textInputSteps.has(uctx.step):", textInputSteps.has(String(uctx.step ?? "")));
+
+  // Handler especial para quando está esperando vinculação do telão
+  if (uctx.step === "ROOM_CREATE_WAIT_VINC") {
+    actions.push(actionSend({ 
+      channel: "private", 
+      chat_id: sender_chat_id, 
+      text: "📡 Para vincular o telão, vá ao grupo e envie:\n\n`vinc " + (roomCodeForSteps || "XX") + "`\n\n(Use o código da sala que apareceu na mensagem anterior)"
+    }));
+    return buildOutput(state, actions, { wait_vinc: true }, message);
+  }
+
+  if (roomForSteps && uctx.step?.startsWith("ROOM_CREATE_")) {
+    // Usar roomForSteps diretamente (não redeclarar room aqui para evitar TDZ com const room abaixo)
+    
     if (uctx.step === "ROOM_CREATE_VISIBILITY") {
       let vNum = null;
       if (c.cmd === "number") vNum = c.n;
@@ -1891,10 +2355,10 @@ if (parsed.kind === "PRIVATE_TEXT") {
         return buildOutput(state, actions, { create_visibility: "invalid" }, message);
       }
 
-      room.visibility = vNum === 1 ? "publica" : vNum === 2 ? "privada" : "oculta";
+      roomForSteps.visibility = vNum === 1 ? "publica" : vNum === 2 ? "privada" : "oculta";
 
-      if (room.visibility === "publica") {
-        room.password = null;
+      if (roomForSteps.visibility === "publica") {
+        roomForSteps.password = null;
         uctx.step = "ROOM_CREATE_MODE";
         actions.push(
           actionSend({
@@ -1922,7 +2386,7 @@ if (parsed.kind === "PRIVATE_TEXT") {
           channel: "private",
           chat_id: sender_chat_id,
           text: [
-            room.visibility === "privada" ? "🔒 Sala definida como: Privada" : "🙈 Sala definida como: Oculta",
+            roomForSteps.visibility === "privada" ? "🔒 Sala definida como: Privada" : "🙈 Sala definida como: Oculta",
             "",
             "🔐 Como esta sala exige senha obrigatoriamente…",
             "",
@@ -1945,7 +2409,7 @@ if (parsed.kind === "PRIVATE_TEXT") {
         return buildOutput(state, actions, { create_password: "too_short" }, message);
       }
 
-      room.password = pass;
+      roomForSteps.password = pass;
       uctx.step = "ROOM_CREATE_MODE";
       actions.push(
         actionSend({
@@ -1973,14 +2437,14 @@ if (parsed.kind === "PRIVATE_TEXT") {
         return buildOutput(state, actions, { create_mode: "invalid" }, message);
       }
 
-      room.mode = c.n === 2 ? "EAY" : "CLASSIC";
+      roomForSteps.mode = c.n === 2 ? "EAY" : "CLASSIC";
       uctx.step = "ROOM_CREATE_ROUNDS";
       actions.push(
         actionSend({
           channel: "private",
           chat_id: sender_chat_id,
           text: [
-            `🎮 Modo definido: ${room.mode === "EAY" ? "EAY (Enough About You)" : "Clássico"}`,
+            `🎮 Modo definido: ${roomForSteps.mode === "EAY" ? "EAY (Enough About You)" : "Clássico"}`,
             "",
             "━━━━━━━━━━━━━━━",
             "🔢 Passo 5/5 — Número de rodadas",
@@ -1999,21 +2463,21 @@ if (parsed.kind === "PRIVATE_TEXT") {
         return buildOutput(state, actions, { create_rounds: "invalid" }, message);
       }
 
-      room.rounds_total = n;
+      roomForSteps.rounds_total = n;
       uctx.step = "ROOM_CREATE_WAIT_VINC";
       actions.push(
         actionSend({
           channel: "private",
           chat_id: sender_chat_id,
           text: [
-            `🔢 Número de rodadas definido: ${room.rounds_total}`,
+            `🔢 Número de rodadas definido: ${roomForSteps.rounds_total}`,
             "",
             "━━━━━━━━━━━━━━━",
             "📡 ÚLTIMO PASSO — Vincular o Telão",
             "",
             "Agora vá até o grupo que será o telão da sala e envie:",
             "",
-            `vinc ${room.code}`,
+            `vinc ${roomForSteps.code}`,
             "",
             "(Envie exatamente assim no grupo)",
             "",
@@ -2105,11 +2569,16 @@ if (parsed.kind === "PRIVATE_TEXT") {
         return buildOutput(state, actions, { config: "back_panel" }, message);
       }
       if (n === 1) {
+        uctx.step = "CONFIG_RENAME";
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `📝 ALTERAR NOME DA SALA\n\nNome atual: ${room.name}\n\nDigite o novo nome 👇\n\n(Máximo 25 caracteres)` }));
+        return buildOutput(state, actions, { config: "rename_prompt" }, message);
+      }
+      if (n === 2) {
         uctx.step = "CONFIG_ROUNDS";
         actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `🔢 NÚMERO DE RODADAS\n\nAtual: ${room.rounds_total}\n\nDigite um número entre 1 e 10 👇` }));
         return buildOutput(state, actions, { config: "rounds_prompt" }, message);
       }
-      if (n === 2) {
+      if (n === 3) {
         uctx.step = "CONFIG_QTYPES";
         const qt = room.question_types;
         const line = (label, on) => `${label} — ${on ? "✅" : "❌"}`;
@@ -2132,12 +2601,12 @@ if (parsed.kind === "PRIVATE_TEXT") {
         );
         return buildOutput(state, actions, { config: "qtypes_menu" }, message);
       }
-      if (n === 3) {
+      if (n === 4) {
         uctx.step = "CONFIG_MAXPLAYERS";
         actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `👥 MÁXIMO DE JOGADORES\n\nAtual: ${room.max_players}\n\nDigite um número entre 2 e 12 👇` }));
         return buildOutput(state, actions, { config: "max_prompt" }, message);
       }
-      if (n === 4) {
+      if (n === 5) {
         uctx.step = "CONFIG_VISIBILITY";
         actions.push(
           actionSend({
@@ -2157,7 +2626,7 @@ if (parsed.kind === "PRIVATE_TEXT") {
         );
         return buildOutput(state, actions, { config: "vis_menu" }, message);
       }
-      if (n === 5) {
+      if (n === 6) {
         uctx.step = "CONFIG_MODE";
         actions.push(
           actionSend({
@@ -2178,14 +2647,104 @@ if (parsed.kind === "PRIVATE_TEXT") {
         );
         return buildOutput(state, actions, { config: "mode_menu" }, message);
       }
-      if (n === 6) {
+      if (n === 7) {
+        uctx.step = "CONFIG_ADDBOTS";
+        const existingBots = room.players_order.filter((pid) => room.players[pid]?.is_bot).length;
+        const canAdd = Math.max(0, room.max_players - room.players_order.length);
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `🤖 ADICIONAR BOTS\n\nBots atuais: ${existingBots}\nVagas disponíveis: ${canAdd}\n\nDigite a quantidade de bots que deseja adicionar (1-${canAdd}) 👇` }));
+        return buildOutput(state, actions, { config: "addbots_prompt" }, message);
+      }
+      if (n === 8) {
+        uctx.step = "CONFIG_KICK";
+        const playersList = room.players_order
+          .map((pid, idx) => {
+            const p = room.players[pid];
+            if (!p) return null;
+            const isHost = pid === room.host_chat_id;
+            if (isHost) return null;
+            return `${idx + 1}️⃣ ${p.name}${p.is_bot ? " (bot)" : ""}`;
+          })
+          .filter(Boolean);
+        
+        if (playersList.length === 0) {
+          actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Não há jogadores para expulsar (só você na sala)." }));
+          uctx.step = "ROOM_CONFIG_MENU";
+          actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
+          return buildOutput(state, actions, { config: "kick_no_players" }, message);
+        }
+        
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `🚫 EXPULSAR JOGADOR\n\nSelecione quem deseja expulsar:\n\n${playersList.join("\n")}\n\n0️⃣ Cancelar\n\nDigite o número 👇` }));
+        return buildOutput(state, actions, { config: "kick_prompt" }, message);
+      }
+      if (n === 9) {
         uctx.step = "CONFIG_END_CONFIRM";
         actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Tem certeza que deseja encerrar a sala?\n\n1️⃣ Confirmar\n0️⃣ Cancelar\n\nDigite o número 👇" }));
         return buildOutput(state, actions, { config: "end_confirm" }, message);
       }
 
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Opção inválida. Digite 0 a 6 👇" }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Opção inválida. Digite 0 a 9 👇" }));
       return buildOutput(state, actions, { config: "invalid" }, message);
+    }
+
+    if (uctx.step === "CONFIG_RENAME" && isHost(room, sender_chat_id) && c.cmd === "text") {
+      const newName = String(c.text ?? "").trim().slice(0, 25);
+      if (!newName) {
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Nome inválido. Digite o nome da sala 👇" }));
+        return buildOutput(state, actions, { rename: "invalid" }, message);
+      }
+      room.name = newName;
+      afterBigEventPause(room);
+      uctx.step = "ROOM_CONFIG_MENU";
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome da sala alterado para: ${newName}` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
+      return buildOutput(state, actions, { rename: "ok" }, message);
+    }
+
+    if (uctx.step === "CONFIG_KICK" && isHost(room, sender_chat_id)) {
+      if (c.cmd === "number" && c.n === 0) {
+        uctx.step = "ROOM_CONFIG_MENU";
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room) }));
+        return buildOutput(state, actions, { kick: "cancel" }, message);
+      }
+      
+      const playerIdx = c.cmd === "number" ? c.n - 1 : -1;
+      if (playerIdx < 0) {
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Digite o número do jogador que deseja expulsar 👇" }));
+        return buildOutput(state, actions, { kick: "invalid" }, message);
+      }
+      
+      const playersList = room.players_order.filter(pid => pid !== room.host_chat_id);
+      if (playerIdx >= playersList.length) {
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Número inválido. Digite o número do jogador que deseja expulsar 👇" }));
+        return buildOutput(state, actions, { kick: "invalid_index" }, message);
+      }
+      
+      const kickedPid = playersList[playerIdx];
+      const kickedPlayer = room.players[kickedPid];
+      const kickedName = kickedPlayer?.name ?? "Jogador";
+      const isBot = kickedPlayer?.is_bot ?? false;
+      
+      // Remover jogador
+      delete room.players[kickedPid];
+      room.players_order = room.players_order.filter(pid => pid !== kickedPid);
+      delete room.game.scores[kickedPid];
+      
+      afterBigEventPause(room);
+      uctx.step = "ROOM_CONFIG_MENU";
+      
+      if (isBot) {
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `🤖 O bot ${kickedName} foi removido da sala.` }));
+      } else {
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `🚫 O jogador ${kickedName} foi expulso da sala.` }));
+      }
+      
+      if (room.screen_group_id) {
+        actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: `👋 ${kickedName} foi removido${isBot ? " (bot)" : ""} da sala pelo host.` }));
+        actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: roomPanelText(room), delay_seconds: 1 }));
+      }
+      
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
+      return buildOutput(state, actions, { kick: "ok" }, message);
     }
 
     if (uctx.step === "CONFIG_ROUNDS" && isHost(room, sender_chat_id)) {
@@ -2212,6 +2771,7 @@ if (parsed.kind === "PRIVATE_TEXT") {
 
       const map = { 1: "classica", 2: "vhs", 3: "manchete", 4: "instrucao" };
       const key = map[c.n];
+      
       if (!key) {
         actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Digite 1, 2, 3, 4 ou 0 👇" }));
         return buildOutput(state, actions, { qtypes: "invalid" }, message);
@@ -2226,6 +2786,9 @@ if (parsed.kind === "PRIVATE_TEXT") {
         actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Atualizado: ${key} agora está ${qt[key] ? "✅ ATIVO" : "❌ DESATIVADO"}` }));
       }
       afterBigEventPause(room);
+      // Voltar ao menu de configurações após alterar
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
+      uctx.step = "ROOM_CONFIG_MENU";
       return buildOutput(state, actions, { qtypes: "toggled" }, message);
     }
 
@@ -2249,32 +2812,7 @@ if (parsed.kind === "PRIVATE_TEXT") {
       return buildOutput(state, actions, { max: "ok" }, message);
     }
 
-    if (uctx.step === "CONFIG_VISIBILITY" && isHost(room, sender_chat_id) && c.cmd === "number") {
-      if (c.n === 0) {
-        uctx.step = "ROOM_CONFIG_MENU";
-        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room) }));
-        return buildOutput(state, actions, { vis: "back" }, message);
-      }
-      if (![1, 2, 3].includes(c.n)) {
-        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Digite 1, 2, 3 ou 0 👇" }));
-        return buildOutput(state, actions, { vis: "invalid" }, message);
-      }
 
-      const newVis = c.n === 1 ? "publica" : c.n === 2 ? "privada" : "oculta";
-      room.visibility = newVis;
-      if (newVis === "publica") {
-        room.password = null;
-        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "✅ Sala agora está Pública (sem senha)." }));
-        afterBigEventPause(room);
-        uctx.step = "ROOM_CONFIG_MENU";
-        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
-        return buildOutput(state, actions, { vis: "public_ok" }, message);
-      }
-
-      uctx.step = "CONFIG_SET_PASSWORD";
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "🔐 Esta visibilidade exige senha.\n\nDigite a nova senha 👇\n\n(Mínimo 4 caracteres)" }));
-      return buildOutput(state, actions, { vis: "ask_pwd" }, message);
-    }
 
     if (uctx.step === "CONFIG_SET_PASSWORD" && isHost(room, sender_chat_id) && c.cmd === "text") {
       const pass = String(c.text ?? "").trim();
@@ -2308,6 +2846,43 @@ if (parsed.kind === "PRIVATE_TEXT") {
       actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Modo alterado para ${room.mode === "EAY" ? "EAY (Enough About You)" : "Clássico"}.\n\n(Voltando ao menu…)` }));
       actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
       return buildOutput(state, actions, { mode: "ok" }, message);
+    }
+
+    if (uctx.step === "CONFIG_ADDBOTS" && isHost(room, sender_chat_id)) {
+      const n = c.cmd === "number" ? c.n : c.cmd === "text" ? parseIntStrict(c.text) : null;
+      if (n === null || n < 1) {
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Digite um número válido de bots para adicionar 👇" }));
+        return buildOutput(state, actions, { addbots: "invalid" }, message);
+      }
+      const existingBots = room.players_order.filter((pid) => room.players[pid]?.is_bot).length;
+      const canAdd = Math.max(0, room.max_players - room.players_order.length);
+      const toAdd = Math.min(n, canAdd);
+
+      if (toAdd <= 0) {
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Não é possível adicionar mais bots (sala cheia)." }));
+        uctx.step = "ROOM_CONFIG_MENU";
+        actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
+        return buildOutput(state, actions, { addbots: "room_full" }, message);
+      }
+
+      for (let i = 0; i < toAdd; i++) {
+        const botId = `bot_${room.code}_${existingBots + i + 1}`;
+        const botName = `Bot_${String.fromCharCode(65 + ((existingBots + i) % 26))}`;
+        addPlayerToRoom(room, botId, botName, true);
+      }
+
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `🤖✨ ${toAdd} bot(s) foram adicionados à sua sala!\n\nEles vão participar normalmente: mentir, votar e pontuar 🎲` }));
+
+      if (room.screen_group_id) {
+        const newBots = room.players_order.map((pid) => room.players[pid]).filter((p) => p?.is_bot).slice(-toAdd);
+        for (const b of newBots) actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: `🤖✨ ${b.name} entrou na sala!` }));
+        actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: roomPanelText(room), delay_seconds: 1 }));
+      }
+
+      afterBigEventPause(room);
+      uctx.step = "ROOM_CONFIG_MENU";
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: configMenuText(room), delay_seconds: 0 }));
+      return buildOutput(state, actions, { addbots: "ok" }, message);
     }
 
     if (uctx.step === "CONFIG_END_CONFIRM" && isHost(room, sender_chat_id) && c.cmd === "number") {
@@ -2568,6 +3143,48 @@ if (parsed.kind === "PRIVATE_TEXT") {
       actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "🎲 PAINEL DA SALA\n\n" + roomPanelText(room) }));
       return buildOutput(state, actions, { painel: true }, message);
     }
+  }
+
+  // Se ainda está em um fluxo de input (criação, config, etc) mas não reconheceu o comando
+  if (textInputSteps.has(String(uctx.step ?? ""))) {
+    // Estar em um fluxo de input - não mostrar lobby, pedir para digitar algo válido
+    const stepName = uctx.step ?? "";
+    let helpMsg = "⚠️ Não entendi. ";
+    
+    if (stepName.startsWith("ROOM_CREATE_")) {
+      helpMsg += "Você está no fluxo de criação de sala. ";
+      if (stepName === "ROOM_CREATE_NAME") helpMsg += "Digite o nome da sala.";
+      else if (stepName === "ROOM_CREATE_VISIBILITY") helpMsg += "Digite 1, 2 ou 3.";
+      else if (stepName === "ROOM_CREATE_PASSWORD") helpMsg += "Digite uma senha (mínimo 4 caracteres).";
+      else if (stepName === "ROOM_CREATE_MODE") helpMsg += "Digite 1 ou 2.";
+      else if (stepName === "ROOM_CREATE_ROUNDS") helpMsg += "Digite um número entre 1 e 10.";
+      else if (stepName === "ROOM_CREATE_WAIT_VINC") helpMsg += "Vá ao grupo e envie: vinc XX";
+    } else if (stepName.startsWith("CONFIG_")) {
+      helpMsg += "Você está no menu de configuração. ";
+      if (stepName === "CONFIG_RENAME") helpMsg += "Digite o novo nome da sala.";
+      else if (stepName === "CONFIG_ROUNDS") helpMsg += "Digite um número entre 1 e 10.";
+      else if (stepName === "CONFIG_QTYPES") helpMsg += "Digite 1, 2, 3, 4 ou 0.";
+      else if (stepName === "CONFIG_MAXPLAYERS") helpMsg += "Digite um número entre 2 e 12.";
+      else if (stepName === "CONFIG_VISIBILITY") helpMsg += "Digite 1, 2, 3 ou 0.";
+      else if (stepName === "CONFIG_MODE") helpMsg += "Digite 1 ou 2.";
+      else if (stepName === "CONFIG_ADDBOTS") helpMsg += "Digite a quantidade de bots.";
+      else if (stepName === "CONFIG_KICK") helpMsg += "Digite o número do jogador.";
+      else if (stepName === "CONFIG_SET_PASSWORD") helpMsg += "Digite uma senha (mínimo 4 caracteres).";
+      else if (stepName === "CONFIG_END_CONFIRM") helpMsg += "Digite 1 para confirmar ou 0 para cancelar.";
+    } else if (stepName === "SET_NAME") {
+      helpMsg = "⚠️ Digite seu nome de jogador.";
+    } else if (stepName === "ENTER_PASSWORD") {
+      helpMsg = "⚠️ Digite a senha da sala.";
+    } else if (stepName === "ASK_TUTORIAL") {
+      helpMsg = "⚠️ Digite 1 (sim) ou 2 (não).";
+    } else if (stepName === "ROOM_CONFIG_MENU") {
+      helpMsg = "⚠️ Digite o número da opção (0 a 9).";
+    } else if (stepName === "IN_ROOM") {
+      helpMsg = "⚠️ Na sala, envie config para configurações ou iniciar para começar.";
+    }
+    
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: helpMsg }));
+    return buildOutput(state, actions, { fallback: "in_flow" }, message);
   }
 
   const fallbackRoomCode = findUserRoomCode();
