@@ -35,26 +35,50 @@ function parseIntStrict(s) {
 function parseMenuNumberLoose(input) {
   const s = String(input ?? "").trim();
   if (!s) return null;
-  
-  // Tentar extrair número de várias formas
+
+  // Normaliza keycaps (0️⃣…9️⃣ e 🔟) para dígitos antes das regex.
+  // Isso evita falha de parsing quando o input contém apenas emoji numérico.
+  const keycapMap = {
+    "0️⃣": "0",
+    "1️⃣": "1",
+    "2️⃣": "2",
+    "3️⃣": "3",
+    "4️⃣": "4",
+    "5️⃣": "5",
+    "6️⃣": "6",
+    "7️⃣": "7",
+    "8️⃣": "8",
+    "9️⃣": "9",
+    "🔟": "10",
+  };
+
+  const keycaps = Object.keys(keycapMap);
+  let keycapNormalized = s;
+  for (const keycap of keycaps) {
+    keycapNormalized = keycapNormalized.split(keycap).join(keycapMap[keycap]);
+  }
+
+  const keycapNumber = parseIntStrict(keycapNormalized);
+  if (keycapNumber !== null) return keycapNumber;
+
+  // Tentar extrair número de várias formas (sobre o texto já normalizado)
   const patterns = [
     /^(\d+)\)?\.?\s*$/,           // 1, 1), 1., 1 ), 1 .
     /^(\d+)\)?\.?\s+.+$/,          // 1 texto, 1) texto
-    /^[🔴1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣8️⃣9️⃣0️⃣]+$/,  // apenas emojis de números
     /^opção\s+(\d+)/i,            // opção 1
     /^opc?\.?\s*(\d+)/i,          // opc 1, opc. 1
   ];
-  
+
   for (const pattern of patterns) {
-    const m = s.match(pattern);
+    const m = keycapNormalized.match(pattern);
     if (m) {
-      const n = parseIntStrict(m[1] || s);
+      const n = parseIntStrict(m[1] || keycapNormalized);
       if (n !== null) return n;
     }
   }
-  
-  // Se nada funcionou, tentar parseIntStrict direto
-  return parseIntStrict(s);
+
+  // Se nada funcionou, tentar parseIntStrict no texto normalizado
+  return parseIntStrict(keycapNormalized);
 }
 
 // Mapeamento de steps legados para steps atuais
