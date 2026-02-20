@@ -2194,9 +2194,9 @@ Digite o novo nome que deseja usar 👇
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: `👤✨ ${profile.name} entrou na sala!` }));
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: roomPanelText(room), delay_seconds: 1 }));
       actions.push(actionSend({ channel: "private", chat_id: room.host_chat_id, text: `👥 Atualização da sala!\n\n${profile.name} entrou.\nOlhe no telão para o painel atualizado.` }));
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n📺 O telão desta sala já está vinculado.\n💡 Para alterar seu nome, use o comando completo: nome Seu Nome` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n📺 O telão desta sala já está vinculado.\n💡 Para alterar seu nome, digite: nome` }));
     } else {
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.\n💡 Para alterar seu nome, use o comando completo: nome Seu Nome` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.\n💡 Para alterar seu nome, digite: nome` }));
     }
 
     return buildOutput(state, actions, { entrar: "ok_public", code }, message);
@@ -2394,9 +2394,9 @@ Digite o novo nome que deseja usar 👇
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: `👤✨ ${profile.name} entrou na sala!` }));
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: roomPanelText(room), delay_seconds: 1 }));
       actions.push(actionSend({ channel: "private", chat_id: room.host_chat_id, text: `👥 Atualização da sala!\n\n${profile.name} entrou.\nOlhe no telão para o painel atualizado.` }));
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n📺 O telão desta sala já está vinculado.\n💡 Para alterar seu nome, use o comando completo: nome Seu Nome` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n📺 O telão desta sala já está vinculado.\n💡 Para alterar seu nome, digite: nome` }));
     } else {
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.\n💡 Para alterar seu nome, use o comando completo: nome Seu Nome` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.\n💡 Para alterar seu nome, digite: nome` }));
     }
     return buildOutput(state, actions, { entrar: "ok_private", code }, message);
   }
@@ -3326,7 +3326,7 @@ Digite o novo nome que deseja usar 👇
   }
 
   if (fallbackRoom && fallbackRoom.status !== "ENDED") {
-    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Não entendi esse comando dentro da sala.\n\nUse comandos completos: config | iniciar | continuar | painel | nome Seu Nome." }));
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Não entendi esse comando dentro da sala.\n\nUse: config, iniciar, continuar, painel ou nome." }));
     return buildOutput(state, actions, { fallback: "in_room_no_lobby" }, message);
   }
 
