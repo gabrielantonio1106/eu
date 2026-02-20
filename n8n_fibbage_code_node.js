@@ -61,7 +61,7 @@ function parseMenuNumberLoose(input) {
   const keycapNumber = parseIntStrict(keycapNormalized);
   if (keycapNumber !== null) return keycapNumber;
 
-  // Tentar extrair número de várias formas (sobre o texto já normalizado)
+  // Reaplicação: extrair número de várias formas sobre o texto já normalizado
   const patterns = [
     /^(\d+)\)?\.?\s*$/,           // 1, 1), 1., 1 ), 1 .
     /^(\d+)\)?\.?\s+.+$/,          // 1 texto, 1) texto
