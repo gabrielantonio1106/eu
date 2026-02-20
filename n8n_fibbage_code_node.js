@@ -158,6 +158,18 @@ function lettersFor(n) {
   return out;
 }
 
+const CEREBRO_AI_PROMPT = [
+  "Você é a IA auxiliar do cérebro do Fibbage (WhatsApp).",
+  "NUNCA envie mensagem direto ao usuário final.",
+  "Seu retorno SEMPRE deve ser estruturado para o cérebro decidir para quem enviar.",
+  "Respeite o reason/scene recebidos no payload.",
+  "Quando gerar pergunta/verdade/mentiras, mantenha texto curto, claro e jogável em PT-BR.",
+  "Quando narrar reveal, use tom divertido, sem ofensas, e sem expor dados sensíveis.",
+  "Formato de saída preferencial:",
+  '{\"updates\": {...}, \"dispatch\": [{\"channel\":\"group|private\",\"chat_id\":\"...\",\"text\":\"...\",\"delay_seconds\":0}]}',
+  "Se não houver dispatch, devolva ao menos updates e um resumo em summary.",
+].join('\n');
+
 function actionSend({ channel, chat_id, text, delay_seconds = 0 }) {
   const d = Math.max(0, Math.floor(Number(delay_seconds) || 0));
   return {
@@ -194,6 +206,11 @@ function actionAiJob(payload, state, message) {
   p.sender_chat_id = String(p.sender_chat_id ?? msg.sender_chat_id ?? "");
   p.sender_name = String(p.sender_name ?? msg.sender_name ?? "");
   p.sala_id = String(p.sala_id ?? "");
+
+  const roomRef = p.sala_id ? state?.rooms?.[p.sala_id] : null;
+  p.group_chat_id = String(p.group_chat_id ?? roomRef?.screen_group_id ?? "");
+  p.host_chat_id = String(p.host_chat_id ?? roomRef?.host_chat_id ?? "");
+  p.system_prompt = String(p.system_prompt ?? CEREBRO_AI_PROMPT);
 
   if (p.estado_json_raw && typeof p.estado_json_raw !== "string") p.estado_json_raw = JSON.stringify(p.estado_json_raw);
   if (p.status_json && typeof p.status_json !== "string") p.status_json = JSON.stringify(p.status_json);
@@ -607,6 +624,22 @@ function ensureUserInRoom(state, sender_chat_id, room_code) {
   const name = u?.name ?? u?.last_seen_name ?? "Jogador";
   addPlayerToRoom(room, sender_chat_id, name, false);
   return room;
+}
+
+function updatePlayerNameAcrossRooms(state, player_chat_id, newName) {
+  for (const room of Object.values(state.rooms || {})) {
+    if (!room || room.status === "ENDED") continue;
+    if (room.players?.[player_chat_id]) {
+      room.players[player_chat_id].name = newName;
+    }
+  }
+}
+
+function resolvePostSetNameStep(uctx, hasActiveRoom) {
+  const prev = String(uctx.step_before_set_name ?? "").trim();
+  uctx.step_before_set_name = null;
+  if (prev) return prev;
+  return hasActiveRoom ? "IN_ROOM" : "BOT_ACCESS";
 }
 
 function parseCommandPrivate(text) {
@@ -1744,6 +1777,39 @@ let state = ensureStateBase(raw.state || compat.st || {});
 state = hydrateStateFromAggregateContext(state, compat);
 const actions = [];
 
+const aiResponseRaw = raw?.ai_response ?? raw?.ai_job_response ?? raw?.response_ai ?? (raw?.route === "ai_response" ? raw : null) ?? message?.ai_response ?? null;
+if (aiResponseRaw) {
+  const aiPayload = deepClone(aiResponseRaw?.payload ?? aiResponseRaw ?? {});
+  const salaId = String(aiPayload.sala_id ?? aiPayload.room_code ?? "");
+  const roomAi = salaId ? state.rooms?.[salaId] : null;
+
+  if (roomAi && aiPayload?.updates && typeof aiPayload.updates === "object") {
+    const upd = aiPayload.updates;
+    if (roomAi?.game?.round && typeof upd.question_text === "string") roomAi.game.round.question_text = upd.question_text;
+    if (roomAi?.game?.round && typeof upd.truth_text === "string") roomAi.game.round.truth_text = upd.truth_text;
+    if (roomAi?.game?.round && typeof upd.narration_text === "string") roomAi.game.round.narration_text = upd.narration_text;
+  }
+
+  const dispatchList = Array.isArray(aiPayload.dispatch) ? aiPayload.dispatch : [];
+  for (const d of dispatchList) {
+    const channel = d?.channel === "group" ? "group" : "private";
+    const cid = String(d?.chat_id ?? (channel === "group" ? roomAi?.screen_group_id : roomAi?.host_chat_id) ?? "");
+    const txt = String(d?.text ?? "").trim();
+    if (!cid || !txt) continue;
+    actions.push(actionSend({ channel, chat_id: cid, text: txt, delay_seconds: d?.delay_seconds ?? 0 }));
+  }
+
+  if (roomAi && dispatchList.length === 0) {
+    const summary = String(aiPayload.summary ?? aiPayload.text ?? "").trim();
+    if (summary) {
+      const targetCid = String(roomAi.screen_group_id ?? roomAi.host_chat_id ?? "");
+      if (targetCid) actions.push(actionSend({ channel: roomAi.screen_group_id ? "group" : "private", chat_id: targetCid, text: summary }));
+    }
+  }
+
+  return buildOutput(state, actions, { ai_response: "handled", sala_id: salaId, dispatch_count: dispatchList.length }, message);
+}
+
 const sender_chat_id = String(message.sender_chat_id ?? "");
 const sender_name = String(message.sender_name ?? "Jogador");
 const chat_type = message.chat_type;
@@ -2059,21 +2125,41 @@ if (parsed.kind === "PRIVATE_TEXT") {
 
   // 处理 "nome" 命令
   if (c.cmd === "nome") {
+    const activeRoomCodeForName = uctx.current_room_code || findUserRoomCode();
+    const hasActiveRoomForName = !!(activeRoomCodeForName && getRoomByCode(activeRoomCodeForName));
     const inlineName = String(c.name ?? "").trim().slice(0, 20);
+
     if (inlineName) {
       profile.name = inlineName;
-      uctx.step = "BOT_ACCESS";
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome alterado com sucesso!\n\n🎭 Agora você é: ${inlineName}` }));
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText(), delay_seconds: 0 }));
+      updatePlayerNameAcrossRooms(state, sender_chat_id, inlineName);
+      uctx.step = resolvePostSetNameStep(uctx, hasActiveRoomForName);
+      if (hasActiveRoomForName) uctx.current_room_code = activeRoomCodeForName;
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome alterado com sucesso!
+
+🎭 Agora você é: ${inlineName}` }));
+      if (hasActiveRoomForName) {
+        const roomForName = getRoomByCode(activeRoomCodeForName);
+        if (roomForName?.screen_group_id) {
+          actions.push(actionSend({ channel: "group", chat_id: roomForName.screen_group_id, text: `🪪 ${inlineName} atualizou o nome no jogo.` }));
+        }
+      }
       return buildOutput(state, actions, { set_name: "ok_inline" }, message);
     }
 
+    uctx.step_before_set_name = String(uctx.step ?? "");
     uctx.step = "SET_NAME";
     actions.push(
       actionSend({
         channel: "private",
         chat_id: sender_chat_id,
-        text: `🪪 ALTERAR NOME\n\nSeu nome atual é:\n${profile.name}\n\nDigite o novo nome que deseja usar 👇\n\n(Máximo 20 caracteres)`,
+        text: `🪪 ALTERAR NOME
+
+Seu nome atual é:
+${profile.name}
+
+Digite o novo nome que deseja usar 👇
+
+(Máximo 20 caracteres)`,
       }),
     );
     return buildOutput(state, actions, { set_name: "prompt" }, message);
@@ -2108,9 +2194,9 @@ if (parsed.kind === "PRIVATE_TEXT") {
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: `👤✨ ${profile.name} entrou na sala!` }));
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: roomPanelText(room), delay_seconds: 1 }));
       actions.push(actionSend({ channel: "private", chat_id: room.host_chat_id, text: `👥 Atualização da sala!\n\n${profile.name} entrou.\nOlhe no telão para o painel atualizado.` }));
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Você entrou na sala ${room.name}.\n\n💡 Para alterar seu nome, digite: nome\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n📺 O telão desta sala já está vinculado.\n💡 Para alterar seu nome, digite: nome` }));
     } else {
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Você entrou na sala ${room.name}.\n\n💡 Para alterar seu nome, digite: nome\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.\n💡 Para alterar seu nome, digite: nome` }));
     }
 
     return buildOutput(state, actions, { entrar: "ok_public", code }, message);
@@ -2254,10 +2340,9 @@ if (parsed.kind === "PRIVATE_TEXT") {
   }
 
   // Handler para SET_NAME - quando usuário está alterando nome
-  // Este handler só deve ser executado se NÃO estiver em uma sala
-  if (uctx.step === "SET_NAME" && !room) {
+  if (uctx.step === "SET_NAME") {
     console.log("[DEBUG] Entrou no handler SET_NAME, cmd:", c.cmd);
-    
+
     if (c.cmd === "text") {
       const newName = String(c.text ?? "").trim().slice(0, 20);
       if (!newName) {
@@ -2265,16 +2350,26 @@ if (parsed.kind === "PRIVATE_TEXT") {
         return buildOutput(state, actions, { set_name: "invalid" }, message);
       }
       profile.name = newName;
-      uctx.step = "BOT_ACCESS";
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome alterado com sucesso!\n\n🎭 Agora você é: ${newName}` }));
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: lobbyMenuText(), delay_seconds: 0 }));
-      console.log("[DEBUG] SET_NAME completo, step alterado para BOT_ACCESS");
+      updatePlayerNameAcrossRooms(state, sender_chat_id, newName);
+
+      const activeRoomCodeForName = uctx.current_room_code || findUserRoomCode();
+      const roomAfterName = activeRoomCodeForName ? getRoomByCode(activeRoomCodeForName) : null;
+      uctx.step = resolvePostSetNameStep(uctx, !!roomAfterName);
+      if (roomAfterName) uctx.current_room_code = activeRoomCodeForName;
+
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Nome alterado com sucesso!
+
+🎭 Agora você é: ${newName}` }));
+      if (roomAfterName?.screen_group_id) {
+        actions.push(actionSend({ channel: "group", chat_id: roomAfterName.screen_group_id, text: `🪪 ${newName} atualizou o nome no jogo.` }));
+      }
+      console.log("[DEBUG] SET_NAME completo, step restaurado para:", uctx.step);
       return buildOutput(state, actions, { set_name: "ok" }, message);
-    } else {
-      // Se recebeu comando em vez de texto no step SET_NAME, mostrar mensagem de erro
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Digite o nome que deseja usar (texto livre) 👇" }));
-      return buildOutput(state, actions, { set_name: "need_text" }, message);
     }
+
+    // Se recebeu comando em vez de texto no step SET_NAME, mostrar mensagem de erro
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Digite o nome que deseja usar (texto livre) 👇" }));
+    return buildOutput(state, actions, { set_name: "need_text" }, message);
   }
 
   // Handler para ENTER_PASSWORD - quando usuário está entrando em sala com senha
@@ -2299,9 +2394,9 @@ if (parsed.kind === "PRIVATE_TEXT") {
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: `👤✨ ${profile.name} entrou na sala!` }));
       actions.push(actionSend({ channel: "group", chat_id: room.screen_group_id, text: roomPanelText(room), delay_seconds: 1 }));
       actions.push(actionSend({ channel: "private", chat_id: room.host_chat_id, text: `👥 Atualização da sala!\n\n${profile.name} entrou.\nOlhe no telão para o painel atualizado.` }));
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Você entrou na sala ${room.name}.\n\n💡 Para alterar seu nome, digite: nome\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n📺 O telão desta sala já está vinculado.\n💡 Para alterar seu nome, digite: nome` }));
     } else {
-      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Você entrou na sala ${room.name}.\n\n💡 Para alterar seu nome, digite: nome\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.` }));
+      actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: `✅ Entrada confirmada! Você entrou na sala ${room.name}.\n\n⚠️ O telão ainda não foi vinculado. Aguarde o host vincular.\n💡 Para alterar seu nome, digite: nome` }));
     }
     return buildOutput(state, actions, { entrar: "ok_private", code }, message);
   }
@@ -3228,6 +3323,11 @@ if (parsed.kind === "PRIVATE_TEXT") {
     );
     if (ai) actions.push(ai);
     return buildOutput(state, actions, { fallback: "ai_help_in_game" }, message);
+  }
+
+  if (fallbackRoom && fallbackRoom.status !== "ENDED") {
+    actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Não entendi esse comando dentro da sala.\n\nUse: config, iniciar, continuar, painel ou nome." }));
+    return buildOutput(state, actions, { fallback: "in_room_no_lobby" }, message);
   }
 
   actions.push(actionSend({ channel: "private", chat_id: sender_chat_id, text: "⚠️ Não entendi esse comando. Dá uma olhada nas opções do menu abaixo 👇" }));
